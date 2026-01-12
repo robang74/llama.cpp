@@ -21,17 +21,16 @@ int main(int argc, char ** argv){
 
     common_init();
 
-    const int n_draft = params.n_draft;
+    const int n_draft = params.speculative.n_max;
 
     // init llama.cpp
     llama_backend_init();
     llama_numa_init(params.numa);
 
     // load the model
-    common_init_result llama_init = common_init_from_params(params);
+    auto llama_init = common_init_from_params(params);
 
-    llama_model * model = llama_init.model;
-    llama_context * ctx = llama_init.context;
+    llama_context * ctx = llama_init->context();
 
     // tokenize the prompt
     std::vector<llama_token> inp;
@@ -40,6 +39,7 @@ int main(int argc, char ** argv){
     common_ngram_cache ngram_cache_context;
     common_ngram_cache ngram_cache_dynamic;
     common_ngram_cache ngram_cache_static;
+
     int64_t t_draft_flat_us = 0;
     int64_t t_draft_us = 0;
 
@@ -148,9 +148,6 @@ int main(int argc, char ** argv){
             t_draft_us*1e-3, 1.0f*t_draft_us/n_drafted, n_drafted/(1e-6*t_draft_us));
     LOG_INF("n_accept     = %d\n", n_accept);
     LOG_INF("accept       = %.3f%%\n", 100.0f * n_accept / n_drafted);
-
-    llama_free(ctx);
-    llama_free_model(model);
 
     llama_backend_free();
 

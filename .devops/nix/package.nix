@@ -31,8 +31,10 @@
   # Increases the runtime closure size by ~700M
   useMpi ? false,
   useRocm ? config.rocmSupport,
+  rocmGpuTargets ? builtins.concatStringsSep ";" rocmPackages.clr.gpuTargets,
   enableCurl ? true,
   useVulkan ? false,
+  useRpc ? false,
   llamaVersion ? "0.0.0", # Arbitrary version, substituted by the flake
 
   # It's necessary to consistently use backendStdenv when building with CUDA support,
@@ -46,6 +48,7 @@ let
   inherit (lib)
     cmakeBool
     cmakeFeature
+    optionalAttrs
     optionals
     strings
     ;
@@ -126,18 +129,14 @@ effectiveStdenv.mkDerivation (finalAttrs: {
   };
 
   postPatch = ''
-    substituteInPlace ./ggml/src/ggml-metal.m \
-      --replace '[bundle pathForResource:@"ggml-metal" ofType:@"metal"];' "@\"$out/bin/ggml-metal.metal\";"
-    substituteInPlace ./ggml/src/ggml-metal.m \
-      --replace '[bundle pathForResource:@"default" ofType:@"metallib"];' "@\"$out/bin/default.metallib\";"
   '';
 
-  # With PR#6015 https://github.com/ggerganov/llama.cpp/pull/6015,
+  # With PR#6015 https://github.com/ggml-org/llama.cpp/pull/6015,
   # `default.metallib` may be compiled with Metal compiler from XCode
   # and we need to escape sandbox on MacOS to access Metal compiler.
   # `xcrun` is used find the path of the Metal compiler, which is varible
   # and not on $PATH
-  # see https://github.com/ggerganov/llama.cpp/pull/6118 for discussion
+  # see https://github.com/ggml-org/llama.cpp/pull/6118 for discussion
   __noChroot = effectiveStdenv.isDarwin && useMetalKit && precompileMetalShaders;
 
   nativeBuildInputs =
@@ -173,10 +172,11 @@ effectiveStdenv.mkDerivation (finalAttrs: {
       (cmakeBool "GGML_NATIVE" false)
       (cmakeBool "GGML_BLAS" useBlas)
       (cmakeBool "GGML_CUDA" useCuda)
-      (cmakeBool "GGML_HIPBLAS" useRocm)
+      (cmakeBool "GGML_HIP" useRocm)
       (cmakeBool "GGML_METAL" useMetalKit)
       (cmakeBool "GGML_VULKAN" useVulkan)
       (cmakeBool "GGML_STATIC" enableStatic)
+      (cmakeBool "GGML_RPC" useRpc)
     ]
     ++ optionals useCuda [
       (
@@ -188,7 +188,7 @@ effectiveStdenv.mkDerivation (finalAttrs: {
     ]
     ++ optionals useRocm [
       (cmakeFeature "CMAKE_HIP_COMPILER" "${rocmPackages.llvm.clang}/bin/clang")
-      (cmakeFeature "CMAKE_HIP_ARCHITECTURES" (builtins.concatStringsSep ";" rocmPackages.clr.gpuTargets))
+      (cmakeFeature "CMAKE_HIP_ARCHITECTURES" rocmGpuTargets)
     ]
     ++ optionals useMetalKit [
       (lib.cmakeFeature "CMAKE_C_FLAGS" "-D__ARM_FEATURE_DOTPROD=1")
@@ -196,7 +196,7 @@ effectiveStdenv.mkDerivation (finalAttrs: {
     ];
 
   # Environment variables needed for ROCm
-  env = optionals useRocm {
+  env = optionalAttrs useRocm {
     ROCM_PATH = "${rocmPackages.clr}";
     HIP_DEVICE_LIB_PATH = "${rocmPackages.rocm-device-libs}/amdgcn/bitcode";
   };
@@ -219,7 +219,7 @@ effectiveStdenv.mkDerivation (finalAttrs: {
     broken = (useMetalKit && !effectiveStdenv.isDarwin);
 
     description = "Inference of LLaMA model in pure C/C++${descriptionSuffix}";
-    homepage = "https://github.com/ggerganov/llama.cpp/";
+    homepage = "https://github.com/ggml-org/llama.cpp/";
     license = lib.licenses.mit;
 
     # Accommodates `nix run` and `lib.getExe`

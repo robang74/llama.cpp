@@ -1,11 +1,16 @@
-#include "llama-impl.h"
-#include "llama-vocab.h"
-#include "llama-sampling.h"
+#include "llama.h"
 
-#include "unicode.h"
+#include "llama-impl.h"
+
+#include "llama-chat.h"
+#include "llama-context.h"
+#include "llama-mmap.h"
+#include "llama-vocab.h"
+#include "llama-model-loader.h"
+#include "llama-model-saver.h"
+#include "llama-model.h"
 
 #include "ggml.h"
-#include "ggml-alloc.h"
 #include "ggml-backend.h"
 
 #if defined(GGML_USE_VULKAN)
@@ -63,33 +68,14 @@
 #endif
 
 #include <algorithm>
-#include <array>
 #include <cassert>
-#include <cctype>
-#include <cfloat>
 #include <cinttypes>
-#include <climits>
-#include <cmath>
-#include <cstdarg>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <ctime>
-#include <fstream>
-#include <functional>
-#include <future>
-#include <initializer_list>
-#include <locale>
-#include <map>
-#include <memory>
-#include <mutex>
-#include <numeric>
-#include <set>
-#include <sstream>
-#include <thread>
-#include <type_traits>
-#include <unordered_map>
+#include <stdexcept>
 
 #if defined(_MSC_VER)
 #pragma warning(disable: 4244 4267) // possible loss of data
@@ -19346,86 +19332,734 @@ void llama_lora_adapter_free(struct llama_lora_adapter * adapter) {
 //
 // interface implementation
 //
-struct llama_model_params llama_model_default_params() {
-    struct llama_model_params result = {
-        /*.n_gpu_layers                =*/ 0,
-        /*.split_mode                  =*/ LLAMA_SPLIT_MODE_LAYER,
-        /*.main_gpu                    =*/ 0,
-        /*.tensor_split                =*/ nullptr,
-        /*.rpc_servers                 =*/ nullptr,
-        /*.progress_callback           =*/ nullptr,
-        /*.progress_callback_user_data =*/ nullptr,
-        /*.kv_overrides                =*/ nullptr,
-        /*.vocab_only                  =*/ false,
-        /*.use_mmap                    =*/ true,
-        /*.use_mlock                   =*/ false,
-        /*.check_tensors               =*/ false,
-    };
 
-#ifdef GGML_USE_METAL
-    // note: we usually have plenty of VRAM, so by default offload all layers to the GPU
-    result.n_gpu_layers = 999;
-#endif
-
-    return result;
+const char * llama_flash_attn_type_name(enum llama_flash_attn_type flash_attn_type) {
+    switch (flash_attn_type) {
+        case LLAMA_FLASH_ATTN_TYPE_AUTO:
+            return "auto";
+        case LLAMA_FLASH_ATTN_TYPE_DISABLED:
+            return "disabled";
+        case LLAMA_FLASH_ATTN_TYPE_ENABLED:
+            return "enabled";
+    }
+    GGML_ABORT("fatal error");
 }
 
-struct llama_context_params llama_context_default_params() {
-    struct llama_context_params result = {
-        /*.n_ctx                       =*/ 512,
-        /*.n_batch                     =*/ 2048,
-        /*.n_ubatch                    =*/ 512,
-        /*.n_seq_max                   =*/ 1,
-        /*.n_threads                   =*/ GGML_DEFAULT_N_THREADS, // TODO: better default
-        /*.n_threads_batch             =*/ GGML_DEFAULT_N_THREADS,
-        /*.rope_scaling_type           =*/ LLAMA_ROPE_SCALING_TYPE_UNSPECIFIED,
-        /*.pooling_type                =*/ LLAMA_POOLING_TYPE_UNSPECIFIED,
-        /*.attention_type              =*/ LLAMA_ATTENTION_TYPE_UNSPECIFIED,
-        /*.rope_freq_base              =*/ 0.0f,
-        /*.rope_freq_scale             =*/ 0.0f,
-        /*.yarn_ext_factor             =*/ -1.0f,
-        /*.yarn_attn_factor            =*/ 1.0f,
-        /*.yarn_beta_fast              =*/ 32.0f,
-        /*.yarn_beta_slow              =*/ 1.0f,
-        /*.yarn_orig_ctx               =*/ 0,
-        /*.defrag_thold                =*/ -1.0f,
-        /*.cb_eval                     =*/ nullptr,
-        /*.cb_eval_user_data           =*/ nullptr,
-        /*.type_k                      =*/ GGML_TYPE_F16,
-        /*.type_v                      =*/ GGML_TYPE_F16,
-        /*.logits_all                  =*/ false,
-        /*.embeddings                  =*/ false,
-        /*.offload_kqv                 =*/ true,
-        /*.flash_attn                  =*/ false,
-        /*.no_perf                     =*/ true,
-        /*.abort_callback              =*/ nullptr,
-        /*.abort_callback_data         =*/ nullptr,
+struct llama_device_memory_data {
+    int64_t total;
+    int64_t free;
+    llama_memory_breakdown_data mb;
+};
+
+static std::vector<llama_device_memory_data> llama_get_device_memory_data(
+        const char * path_model, const llama_model_params * mparams, const llama_context_params * cparams,
+        std::vector<ggml_backend_dev_t> & devs, uint32_t & hp_ngl, uint32_t & hp_n_ctx_train, uint32_t & hp_n_expert,
+        const ggml_log_level log_level) {
+    struct user_data_t {
+        struct {
+            ggml_log_callback callback;
+            void * user_data;
+        } original_logger;
+        ggml_log_level min_level; // prints below this log level go to debug log
+    };
+    user_data_t ud;
+    llama_log_get(&ud.original_logger.callback, &ud.original_logger.user_data);
+    ud.min_level = log_level;
+
+    llama_log_set([](ggml_log_level level, const char * text, void * user_data) {
+        const user_data_t * ud = (const user_data_t *) user_data;
+        const ggml_log_level level_eff = level >= ud->min_level ? level : GGML_LOG_LEVEL_DEBUG;
+        ud->original_logger.callback(level_eff, text, ud->original_logger.user_data);
+    }, &ud);
+
+    llama_model_params mparams_copy = *mparams;
+    mparams_copy.no_alloc  = true;
+    mparams_copy.use_mmap  = false;
+    mparams_copy.use_mlock = false;
+
+    llama_model * model = llama_model_load_from_file(path_model, mparams_copy);
+    if (model == nullptr) {
+        llama_log_set(ud.original_logger.callback, ud.original_logger.user_data);
+        throw std::runtime_error("failed to load model");
+    }
+
+    llama_context * ctx = llama_init_from_model(model, *cparams);
+    if (ctx == nullptr) {
+        llama_model_free(model);
+        llama_log_set(ud.original_logger.callback, ud.original_logger.user_data);
+        throw std::runtime_error("failed to create llama_context from model");
+    }
+
+    std::vector<llama_device_memory_data> ret(model->devices.size());
+
+    std::map<ggml_backend_buffer_type_t, llama_memory_breakdown_data> memory_breakdown = ctx->memory_breakdown();
+
+    for (const auto & [buft, mb] : memory_breakdown) {
+        if (ggml_backend_buft_is_host(buft)) {
+            continue;
+        }
+
+        ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+        if (!dev) {
+            continue;
+        }
+        for (size_t i = 0; i < ret.size(); i++) {
+            if (model->devices[i] == dev) {
+                ret[i].mb.model   += mb.model;
+                ret[i].mb.context += mb.context;
+                ret[i].mb.compute += mb.compute;
+                break;
+            }
+        }
+    }
+    for (size_t i = 0; i < ret.size(); i++) {
+        size_t free;
+        size_t total;
+        ggml_backend_dev_memory(model->devices[i], &free, &total);
+
+        // devices can return 0 bytes for free and total memory if they do not
+        // have any to report. in this case, we will use the host memory as a fallback
+        // fixes: https://github.com/ggml-org/llama.cpp/issues/18577
+        if (free == 0 && total == 0) {
+            ggml_backend_dev_t cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+            if (cpu_dev == nullptr) {
+                throw std::runtime_error(format("%s: no CPU backend found", __func__));
+            }
+            ggml_backend_dev_memory(cpu_dev, &free, &total);
+        }
+        ret[i].free  = free;
+        ret[i].total = total;
+    }
+
+    devs           = model->devices;
+    hp_ngl         = model->hparams.n_layer;
+    hp_n_ctx_train = model->hparams.n_ctx_train;
+    hp_n_expert    = model->hparams.n_expert;
+
+    llama_memory_breakdown_print(ctx); // goes to debug log
+
+    llama_free(ctx);
+    llama_model_free(model);
+    llama_log_set(ud.original_logger.callback, ud.original_logger.user_data);
+    return ret;
+}
+
+// enum to identify part of a layer for distributing its tensors:
+enum layer_fraction_t {
+    LAYER_FRACTION_NONE = 0, // nothing
+    LAYER_FRACTION_ATTN = 1, // attention
+    LAYER_FRACTION_UP   = 2, // attention + up
+    LAYER_FRACTION_GATE = 3, // attention + up + gate
+    LAYER_FRACTION_MOE  = 4, // everything but sparse MoE weights
+};
+// this enum is only used in llama_params_fit_impl but needs to be defined outside of it to fix a Windows compilation issue
+
+class llama_params_fit_exception : public std::runtime_error {
+    using std::runtime_error::runtime_error;
+};
+
+static void llama_params_fit_impl(
+        const char * path_model, struct llama_model_params * mparams, struct llama_context_params * cparams,
+        float * tensor_split, struct llama_model_tensor_buft_override * tensor_buft_overrides,
+        size_t * margins_s, uint32_t n_ctx_min, enum ggml_log_level log_level) {
+    constexpr int64_t MiB = 1024*1024;
+    typedef std::vector<llama_device_memory_data> dmds_t;
+    const llama_model_params default_mparams = llama_model_default_params();
+
+    std::vector<ggml_backend_dev_t> devs;
+    uint32_t hp_ngl = 0; // hparams.n_gpu_layers
+    uint32_t hp_nct = 0; // hparams.n_ctx_train
+    uint32_t hp_nex = 0; // hparams.n_expert
+
+    // step 1: get data for default parameters and check whether any changes are necessary in the first place
+
+    LLAMA_LOG_DEBUG("%s: getting device memory data for initial parameters:\n", __func__);
+    const dmds_t dmds_full = llama_get_device_memory_data(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
+    const size_t nd = devs.size(); // number of devices
+    if (nd == 0) {
+        LLAMA_LOG_INFO("%s: no devices with dedicated memory found\n", __func__);
+        return;
+    }
+
+    std::vector<int64_t> margins; // this function uses int64_t rather than size_t for memory sizes to more conveniently handle deficits
+    margins.reserve(nd);
+    for (size_t id = 0; id < nd; id++) {
+        margins.push_back(margins_s[id]);
+    }
+
+    std::vector<std::string> dev_names;
+    {
+        dev_names.reserve(nd);
+        size_t max_length = 0;
+        for (ggml_backend_dev_t dev : devs) {
+            std::string name = ggml_backend_dev_name(dev);
+            name += " (";
+            name += ggml_backend_dev_description(dev);
+            name += ")";
+            dev_names.push_back(name);
+            max_length = std::max(max_length, name.length());
+        }
+        for (std::string & dn : dev_names) {
+            dn.insert(dn.end(), max_length - dn.length(), ' ');
+        }
+    }
+
+    int64_t sum_free            = 0;
+    int64_t sum_projected_free  = 0;
+    int64_t sum_projected_used  = 0;
+    int64_t sum_projected_model = 0;
+    std::vector<int64_t> projected_free_per_device;
+    projected_free_per_device.reserve(nd);
+
+    if (nd > 1) {
+        LLAMA_LOG_INFO("%s: projected memory use with initial parameters [MiB]:\n", __func__);
+    }
+    for (size_t id = 0; id < nd; id++) {
+        const llama_device_memory_data & dmd = dmds_full[id];
+
+        const int64_t projected_used = dmd.mb.total();
+        const int64_t projected_free = dmd.free - projected_used;
+        projected_free_per_device.push_back(projected_free);
+
+        sum_free            += dmd.free;
+        sum_projected_used  += projected_used;
+        sum_projected_free  += projected_free;
+        sum_projected_model += dmd.mb.model;
+
+        if (nd > 1) {
+            LLAMA_LOG_INFO("%s:   - %s: %6" PRId64 " total, %6" PRId64 " used, %6" PRId64 " free vs. target of %6" PRId64 "\n",
+                __func__, dev_names[id].c_str(), dmd.total/MiB, projected_used/MiB, projected_free/MiB, margins[id]/MiB);
+        }
+    }
+    assert(sum_free >= 0 && sum_projected_used >= 0);
+    LLAMA_LOG_INFO("%s: projected to use %" PRId64 " MiB of device memory vs. %" PRId64 " MiB of free device memory\n",
+        __func__, sum_projected_used/MiB, sum_free/MiB);
+    if (nd == 1) {
+        if (projected_free_per_device[0] >= margins[0]) {
+            LLAMA_LOG_INFO("%s: will leave %" PRId64 " >= %" PRId64 " MiB of free device memory, no changes needed\n",
+                __func__, projected_free_per_device[0]/MiB, margins[0]/MiB);
+            return;
+        }
+    } else {
+        bool changes_needed = false;
+        for (size_t id = 0; id < nd; id++) {
+            if (projected_free_per_device[id] < margins[id]) {
+                changes_needed = true;
+                break;
+            }
+        }
+        if (!changes_needed) {
+            LLAMA_LOG_INFO("%s: targets for free memory can be met on all devices, no changes needed\n", __func__);
+            return;
+        }
+    }
+
+    // step 2: try reducing memory use by reducing the context size
+
+    {
+        int64_t global_surplus = sum_projected_free;
+        for (size_t id = 0; id < nd; id++) {
+            global_surplus -= margins[id];
+        }
+        if (global_surplus < 0) {
+            if (nd == 1) {
+                LLAMA_LOG_INFO("%s: cannot meet free memory target of %" PRId64 " MiB, need to reduce device memory by %" PRId64 " MiB\n",
+                    __func__, margins[0]/MiB, -global_surplus/MiB);
+            } else {
+                LLAMA_LOG_INFO(
+                    "%s: cannot meet free memory targets on all devices, need to use %" PRId64 " MiB less in total\n",
+                    __func__, -global_surplus/MiB);
+            }
+            if (cparams->n_ctx == 0) {
+                if (hp_nct > n_ctx_min) {
+                    int64_t sum_used_target = sum_free;
+                    for (size_t id = 0; id < nd; id++) {
+                        sum_used_target -= margins[id];
+                    }
+                    if (nd > 1) {
+                        // for multiple devices we need to be more conservative in terms of how much context we think can fit:
+                        //   - for dense models only whole layers can be assigned to devices
+                        //   - for MoE models only whole tensors can be assigned to devices, which we estimate to be <= 1/3 of a layer
+                        //   - on average we expect a waste of 0.5 layers/tensors per device
+                        //   - use slightly more than the expected average for nd devices to be safe
+                        const int64_t model_per_layer = sum_projected_model / std::min(uint32_t(mparams->n_gpu_layers), hp_ngl);
+                        sum_used_target -= (nd + 1) * model_per_layer / (hp_nex == 0 ? 2 : 6);
+                    }
+
+                    int64_t sum_projected_used_min_ctx = 0;
+                    cparams->n_ctx = n_ctx_min;
+                    const dmds_t dmds_min_ctx = llama_get_device_memory_data(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
+                    for (const auto & dmd : dmds_min_ctx) {
+                        sum_projected_used_min_ctx += dmd.mb.total();
+                    }
+                    if (sum_used_target > sum_projected_used_min_ctx) {
+                        // linear interpolation between minimum and maximum context size:
+                        cparams->n_ctx += (hp_nct - n_ctx_min) * (sum_used_target - sum_projected_used_min_ctx)
+                            / (sum_projected_used - sum_projected_used_min_ctx);
+                        cparams->n_ctx = std::max(cparams->n_ctx - cparams->n_ctx % 256, n_ctx_min); // round down context for CUDA backend
+
+                        const int64_t bytes_per_ctx = (sum_projected_used - sum_projected_used_min_ctx) / (hp_nct - n_ctx_min);
+                        const int64_t memory_reduction = (hp_nct - cparams->n_ctx) * bytes_per_ctx;
+                        LLAMA_LOG_INFO("%s: context size reduced from %" PRIu32 " to %" PRIu32 " -> need %" PRId64 " MiB less memory in total\n",
+                            __func__, hp_nct, cparams->n_ctx, memory_reduction/MiB);
+                        if (nd == 1) {
+                            LLAMA_LOG_INFO("%s: entire model can be fit by reducing context\n", __func__);
+                            return;
+                        }
+                        LLAMA_LOG_INFO("%s: entire model should be fit across devices by reducing context\n", __func__);
+                    } else {
+                        const int64_t memory_reduction = sum_projected_used - sum_projected_used_min_ctx;
+                        LLAMA_LOG_INFO("%s: context size reduced from %" PRIu32 " to %" PRIu32 " -> need %" PRId64 " MiB less memory in total\n",
+                            __func__, hp_nct, cparams->n_ctx, memory_reduction/MiB);
+                    }
+                } else {
+                    LLAMA_LOG_INFO("%s: default model context size is %" PRIu32 " which is <= the min. context size of %" PRIu32 " -> no change\n",
+                        __func__, hp_nct, n_ctx_min);
+                }
+            } else {
+                LLAMA_LOG_INFO("%s: context size set by user to %" PRIu32 " -> no change\n", __func__, cparams->n_ctx);
+            }
+        }
+    }
+
+    if (mparams->n_gpu_layers != default_mparams.n_gpu_layers) {
+        throw llama_params_fit_exception("n_gpu_layers already set by user to " + std::to_string(mparams->n_gpu_layers) + ", abort");
+    }
+    if (nd > 1) {
+        if (!tensor_split) {
+            throw llama_params_fit_exception("did not provide a buffer to write the tensor_split to, abort");
+        }
+        if (mparams->tensor_split) {
+            for (size_t id = 0; id < nd; id++) {
+                if (mparams->tensor_split[id] != 0.0f) {
+                    throw llama_params_fit_exception("model_params::tensor_split already set by user, abort");
+                }
+            }
+        }
+        if (mparams->split_mode == LLAMA_SPLIT_MODE_ROW) {
+            throw llama_params_fit_exception("changing weight allocation for LLAMA_SPLIT_MODE_ROW not implemented, abort");
+        }
+    }
+    if (!tensor_buft_overrides) {
+        throw llama_params_fit_exception("did not provide buffer to set tensor_buft_overrides, abort");
+    }
+    if (mparams->tensor_buft_overrides && (mparams->tensor_buft_overrides->pattern || mparams->tensor_buft_overrides->buft)) {
+        throw llama_params_fit_exception("model_params::tensor_buft_overrides already set by user, abort");
+    }
+
+    // step 3: iteratively fill the back to front with "dense" layers
+    //   - for a dense model simply fill full layers, giving each device a contiguous slice of the model
+    //   - for a MoE model, same as dense model but with all MoE tensors in system memory
+
+    // utility function that returns a static C string matching the tensors for a specific layer index and layer fraction:
+    auto get_overflow_pattern = [&](const size_t il, const layer_fraction_t lf) -> const char * {
+        constexpr size_t n_strings = 1000;
+        if (il >= n_strings) {
+            throw std::runtime_error("at most " + std::to_string(n_strings) + " model layers are supported");
+        }
+        switch (lf) {
+            case LAYER_FRACTION_ATTN: {
+                static std::array<std::string, n_strings> patterns;
+                if (patterns[il].empty()) {
+                    patterns[il] = "blk\\." + std::to_string(il) + "\\.ffn_(up|gate|down).*";
+                }
+                return patterns[il].c_str();
+            }
+            case LAYER_FRACTION_UP: {
+                static std::array<std::string, n_strings> patterns;
+                if (patterns[il].empty()) {
+                    patterns[il] = "blk\\." + std::to_string(il) + "\\.ffn_(gate|down).*";
+                }
+                return patterns[il].c_str();
+            }
+            case LAYER_FRACTION_GATE: {
+                static std::array<std::string, n_strings> patterns;
+                if (patterns[il].empty()) {
+                    patterns[il] = "blk\\." + std::to_string(il) + "\\.ffn_down.*";
+                }
+                return patterns[il].c_str();
+            }
+            case LAYER_FRACTION_MOE: {
+                static std::array<std::string, n_strings> patterns;
+                if (patterns[il].empty()) {
+                    patterns[il] = "blk\\." + std::to_string(il) + "\\.ffn_(up|down|gate)_(ch|)exps";
+                }
+                return patterns[il].c_str();
+            }
+            default:
+                GGML_ABORT("fatal error");
+        }
     };
 
-    return result;
+    struct ngl_t {
+        uint32_t n_layer = 0; // number of total layers
+        uint32_t n_part  = 0; // number of partial layers, <= n_layer
+
+        // for the first partial layer varying parts can overflow, all further layers use LAYER_FRACTION_MOE:
+        layer_fraction_t overflow_type = LAYER_FRACTION_MOE;
+
+        uint32_t n_full() const {
+            assert(n_layer >= n_part);
+            return n_layer - n_part;
+        }
+    };
+
+    const size_t ntbo = llama_max_tensor_buft_overrides();
+
+    // utility function to set n_gpu_layers and tensor_split
+    auto set_ngl_tensor_split_tbo = [&](
+            const std::vector<ngl_t> & ngl_per_device,
+            const std::vector<ggml_backend_buffer_type_t> & overflow_bufts,
+            llama_model_params & mparams) {
+        mparams.n_gpu_layers = 0;
+        for (size_t id = 0; id < nd; id++) {
+            mparams.n_gpu_layers += ngl_per_device[id].n_layer;
+            if (nd > 1) {
+                tensor_split[id] = ngl_per_device[id].n_layer;
+            }
+        }
+        assert(uint32_t(mparams.n_gpu_layers) <= hp_ngl + 1);
+        uint32_t il0 = hp_ngl + 1 - mparams.n_gpu_layers; // start index for tensor buft overrides
+
+        mparams.tensor_split = tensor_split;
+
+        size_t itbo = 0;
+        for (size_t id = 0; id < nd; id++) {
+            il0 += ngl_per_device[id].n_full();
+            for (uint32_t il = il0; il < il0 + ngl_per_device[id].n_part; il++) {
+                if (itbo + 1 >= ntbo) {
+                    tensor_buft_overrides[itbo].pattern = nullptr;
+                    tensor_buft_overrides[itbo].buft    = nullptr;
+                    itbo++;
+                    mparams.tensor_buft_overrides = tensor_buft_overrides;
+                    throw llama_params_fit_exception("llama_max_tensor_buft_overrides() == "
+                        + std::to_string(ntbo) + " is insufficient for model");
+                }
+                tensor_buft_overrides[itbo].pattern = get_overflow_pattern(il, il == il0 ? ngl_per_device[id].overflow_type : LAYER_FRACTION_MOE);
+                tensor_buft_overrides[itbo].buft = il == il0 ? overflow_bufts[id] : ggml_backend_cpu_buffer_type();
+                itbo++;
+            }
+            il0 += ngl_per_device[id].n_part;
+        }
+        tensor_buft_overrides[itbo].pattern = nullptr;
+        tensor_buft_overrides[itbo].buft    = nullptr;
+        itbo++;
+        mparams.tensor_buft_overrides = tensor_buft_overrides;
+    };
+
+    // utility function that returns the memory use per device for given numbers of layers per device
+    auto get_memory_for_layers = [&](
+            const char * func_name,
+            const std::vector<ngl_t> & ngl_per_device,
+            const std::vector<ggml_backend_buffer_type_t> & overflow_bufts) -> std::vector<int64_t> {
+        llama_model_params mparams_copy = *mparams;
+        set_ngl_tensor_split_tbo(ngl_per_device, overflow_bufts, mparams_copy);
+
+        const dmds_t dmd_nl = llama_get_device_memory_data(
+            path_model, &mparams_copy, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
+
+        LLAMA_LOG_DEBUG("%s: memory for test allocation by device:\n", func_name);
+        for (size_t id = 0; id < nd; id++) {
+            const ngl_t & n = ngl_per_device[id];
+            LLAMA_LOG_DEBUG(
+                "%s: id=%zu, n_layer=%2" PRIu32 ", n_part=%2" PRIu32 ", overflow_type=%d, mem=%6" PRId64 " MiB\n",
+                func_name, id, n.n_layer, n.n_part, int(n.overflow_type), dmd_nl[id].mb.total()/MiB);
+        }
+
+        std::vector<int64_t> ret;
+        ret.reserve(nd);
+        for (const llama_device_memory_data & dmd : dmd_nl) {
+            ret.push_back(dmd.mb.total());
+        }
+        return ret;
+    };
+
+    int64_t global_surplus_cpu_moe = 0;
+    if (hp_nex > 0) {
+        const static std::string pattern_moe_all = "blk\\.\\d+\\.ffn_(up|down|gate)_(ch|)exps"; // matches all MoE tensors
+        ggml_backend_buffer_type_t cpu_buft = ggml_backend_cpu_buffer_type();
+        tensor_buft_overrides[0] = {pattern_moe_all.c_str(), cpu_buft};
+        tensor_buft_overrides[1] = {nullptr, nullptr};
+        mparams->tensor_buft_overrides = tensor_buft_overrides;
+
+        LLAMA_LOG_DEBUG("%s: getting device memory data with all MoE tensors moved to system memory:\n", __func__);
+        const dmds_t dmds_cpu_moe = llama_get_device_memory_data(
+            path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
+
+        for (size_t id = 0; id < nd; id++) {
+            global_surplus_cpu_moe += dmds_cpu_moe[id].free;
+            global_surplus_cpu_moe -= int64_t(dmds_cpu_moe[id].mb.total()) + margins[id];
+        }
+
+        if (global_surplus_cpu_moe > 0) {
+            LLAMA_LOG_INFO("%s: with only dense weights in device memory there is a total surplus of %" PRId64 " MiB\n",
+                __func__, global_surplus_cpu_moe/MiB);
+        } else {
+            LLAMA_LOG_INFO("%s: with only dense weights in device memory there is still a total deficit of %" PRId64 " MiB\n",
+                __func__, -global_surplus_cpu_moe/MiB);
+        }
+
+        // reset
+        tensor_buft_overrides[0] = {nullptr, nullptr};
+        mparams->tensor_buft_overrides = tensor_buft_overrides;
+    }
+
+    std::vector<int64_t> targets; // maximum acceptable memory use per device
+    targets.reserve(nd);
+    for (size_t id = 0; id < nd; id++) {
+        targets.push_back(dmds_full[id].free - margins[id]);
+        LLAMA_LOG_DEBUG("%s: id=%zu, target=%" PRId64 " MiB\n", __func__, id, targets[id]/MiB);
+    }
+
+    std::vector<ggml_backend_buffer_type_t> overflow_bufts; // which bufts the first partial layer of a device overflows to:
+    overflow_bufts.reserve(nd);
+    for (size_t id = 0; id < nd; id++) {
+        overflow_bufts.push_back(ggml_backend_cpu_buffer_type());
+    }
+
+    std::vector<ngl_t> ngl_per_device(nd);
+    std::vector<int64_t> mem = get_memory_for_layers(__func__, ngl_per_device, overflow_bufts);
+
+    // optimize the number of layers per device using the method of false position:
+    //   - ngl_per_device has 0 layers for each device, lower bound
+    //   - try a "high" configuration where a device is given all unassigned layers
+    //   - interpolate the memory use / layer between low and high linearly to get a guess where it meets our target
+    //   - check memory use of our guess, replace either the low or high bound
+    //   - once we only have a difference of a single layer, stop and return the lower bound that just barely still fits
+    //   - the last device has the output layer, which cannot be a partial layer
+    if (hp_nex == 0) {
+        LLAMA_LOG_INFO("%s: filling dense layers back-to-front:\n", __func__);
+    } else {
+        LLAMA_LOG_INFO("%s: filling dense-only layers back-to-front:\n", __func__);
+    }
+    for (int id = nd - 1; id >= 0; id--) {
+        uint32_t n_unassigned = hp_ngl + 1;
+        for (size_t jd = id + 1; jd < nd; ++jd) {
+            assert(n_unassigned >= ngl_per_device[jd].n_layer);
+            n_unassigned -= ngl_per_device[jd].n_layer;
+        }
+
+        std::vector<ngl_t> ngl_per_device_high = ngl_per_device;
+        ngl_per_device_high[id].n_layer = n_unassigned;
+        if (hp_nex > 0) {
+            ngl_per_device_high[id].n_part = size_t(id) < nd - 1 ? ngl_per_device_high[id].n_layer : ngl_per_device_high[id].n_layer - 1;
+        }
+        if (ngl_per_device_high[id].n_layer > 0) {
+            std::vector<int64_t> mem_high = get_memory_for_layers(__func__, ngl_per_device_high, overflow_bufts);
+            if (mem_high[id] > targets[id]) {
+                assert(ngl_per_device_high[id].n_layer > ngl_per_device[id].n_layer);
+                uint32_t delta = ngl_per_device_high[id].n_layer - ngl_per_device[id].n_layer;
+                LLAMA_LOG_DEBUG("%s: start filling device %" PRIu32 ", delta=%" PRIu32 "\n", __func__, id, delta);
+                while (delta > 1) {
+                    uint32_t step_size = int64_t(delta) * (targets[id] - mem[id]) / (mem_high[id] - mem[id]);
+                    step_size = std::max(step_size, uint32_t(1));
+                    step_size = std::min(step_size, delta - 1);
+
+                    std::vector<ngl_t> ngl_per_device_test = ngl_per_device;
+                    ngl_per_device_test[id].n_layer += step_size;
+                    if (hp_nex) {
+                        ngl_per_device_test[id].n_part += size_t(id) == nd - 1 && ngl_per_device_test[id].n_part == 0 ?
+                            step_size - 1 : step_size; // the first layer is the output layer which must always be full
+                    }
+                    const std::vector<int64_t> mem_test = get_memory_for_layers(__func__, ngl_per_device_test, overflow_bufts);
+
+                    if (mem_test[id] <= targets[id]) {
+                        ngl_per_device = ngl_per_device_test;
+                        mem            = mem_test;
+                        LLAMA_LOG_DEBUG("%s: set ngl_per_device[%d].n_layer=%" PRIu32 "\n", __func__, id, ngl_per_device[id].n_layer);
+                    } else {
+                        ngl_per_device_high = ngl_per_device_test;
+                        mem_high            = mem_test;
+                        LLAMA_LOG_DEBUG("%s: set ngl_per_device_high[%d].n_layer=%" PRIu32 "\n", __func__, id, ngl_per_device_high[id].n_layer);
+                    }
+                    delta = ngl_per_device_high[id].n_layer - ngl_per_device[id].n_layer;
+                }
+            } else {
+                assert(ngl_per_device_high[id].n_layer == n_unassigned);
+                ngl_per_device = ngl_per_device_high;
+                mem            = mem_high;
+                LLAMA_LOG_DEBUG("%s: set ngl_per_device[%d].n_layer=%" PRIu32 "\n", __func__, id, ngl_per_device[id].n_layer);
+            }
+        }
+
+        const int64_t projected_margin = dmds_full[id].free - mem[id];
+        LLAMA_LOG_INFO(
+            "%s:   - %s: %2" PRIu32 " layers, %6" PRId64 " MiB used, %6" PRId64 " MiB free\n",
+            __func__, dev_names[id].c_str(), ngl_per_device[id].n_layer, mem[id]/MiB, projected_margin/MiB);
+    }
+    if (hp_nex == 0 || global_surplus_cpu_moe <= 0) {
+        set_ngl_tensor_split_tbo(ngl_per_device, overflow_bufts, *mparams);
+        return;
+    }
+
+    // step 4: for a MoE model where all dense tensors fit,
+    //     convert the dense-only layers in the back to full layers in the front until all devices are full
+    // essentially the same procedure as for the dense-only layers except front-to-back
+    // also, try fitting at least part of one more layer to reduce waste for "small" GPUs with e.g. 24 GiB VRAM
+
+    size_t id_dense_start = nd;
+    for (int id = nd - 1; id >= 0; id--) {
+        if (ngl_per_device[id].n_layer > 0) {
+            id_dense_start = id;
+            continue;
+        }
+        break;
+    }
+    assert(id_dense_start < nd);
+
+    LLAMA_LOG_INFO("%s: converting dense-only layers to full layers and filling them front-to-back with overflow to next device/system memory:\n", __func__);
+    for (size_t id = 0; id <= id_dense_start && id_dense_start < nd; id++) {
+        std::vector<ngl_t> ngl_per_device_high = ngl_per_device;
+        for (size_t jd = id_dense_start; jd < nd; jd++) {
+            const uint32_t n_layer_move = jd < nd - 1 ? ngl_per_device_high[jd].n_layer : ngl_per_device_high[jd].n_layer - 1;
+            ngl_per_device_high[id].n_layer += n_layer_move;
+            ngl_per_device_high[jd].n_layer -= n_layer_move;
+            ngl_per_device_high[jd].n_part = 0;
+        }
+        size_t id_dense_start_high = nd - 1;
+        std::vector<int64_t> mem_high = get_memory_for_layers(__func__, ngl_per_device_high, overflow_bufts);
+
+        if (mem_high[id] > targets[id]) {
+            assert(ngl_per_device_high[id].n_full() >= ngl_per_device[id].n_full());
+            uint32_t delta = ngl_per_device_high[id].n_full() - ngl_per_device[id].n_full();
+            while (delta > 1) {
+                uint32_t step_size = int64_t(delta) * (targets[id] - mem[id]) / (mem_high[id] - mem[id]);
+                step_size = std::max(step_size, uint32_t(1));
+                step_size = std::min(step_size, delta - 1);
+
+                std::vector<ngl_t> ngl_per_device_test = ngl_per_device;
+                size_t id_dense_start_test = id_dense_start;
+                uint32_t n_converted_test = 0;
+                for (;id_dense_start_test < nd; id_dense_start_test++) {
+                    const uint32_t n_convert_jd = std::min(step_size - n_converted_test, ngl_per_device_test[id_dense_start_test].n_part);
+                    ngl_per_device_test[id_dense_start_test].n_layer -= n_convert_jd;
+                    ngl_per_device_test[id_dense_start_test].n_part -= n_convert_jd;
+                    ngl_per_device_test[id].n_layer += n_convert_jd;
+                    n_converted_test += n_convert_jd;
+
+                    if (ngl_per_device_test[id_dense_start_test].n_part > 0) {
+                        break;
+                    }
+                }
+                const std::vector<int64_t> mem_test = get_memory_for_layers(__func__, ngl_per_device_test, overflow_bufts);
+
+                if (mem_test[id] <= targets[id]) {
+                    ngl_per_device = ngl_per_device_test;
+                    mem            = mem_test;
+                    id_dense_start = id_dense_start_test;
+                    LLAMA_LOG_DEBUG("%s: set ngl_per_device[%zu].(n_layer, n_part)=(%" PRIu32 ", %" PRIu32 "), id_dense_start=%zu\n",
+                        __func__, id, ngl_per_device[id].n_layer, ngl_per_device[id].n_part, id_dense_start);
+                } else {
+                    ngl_per_device_high = ngl_per_device_test;
+                    mem_high            = mem_test;
+                    id_dense_start_high = id_dense_start_test;
+                    LLAMA_LOG_DEBUG("%s: set ngl_per_device_high[%zu].(n_layer, n_part)=(%" PRIu32 ", %" PRIu32 "), id_dense_start_high=%zu\n",
+                        __func__, id, ngl_per_device_high[id].n_layer, ngl_per_device_high[id].n_part, id_dense_start_high);
+                }
+                assert(ngl_per_device_high[id].n_full() >= ngl_per_device[id].n_full());
+                delta = ngl_per_device_high[id].n_full() - ngl_per_device[id].n_full();
+            }
+        } else {
+            ngl_per_device = ngl_per_device_high;
+            mem            = mem_high;
+            id_dense_start = id_dense_start_high;
+            LLAMA_LOG_DEBUG("%s: set ngl_per_device[%zu].(n_layer, n_part)=(%" PRIu32 ", %" PRIu32 "), id_dense_start=%zu\n",
+                __func__, id, ngl_per_device[id].n_layer, ngl_per_device[id].n_part, id_dense_start);
+        }
+
+        // try to fit at least part of one more layer
+        if (ngl_per_device[id_dense_start].n_layer > (id < nd - 1 ? 0 : 1)) {
+            std::vector<ngl_t> ngl_per_device_test = ngl_per_device;
+            size_t id_dense_start_test = id_dense_start;
+            ngl_per_device_test[id_dense_start_test].n_layer--;
+            ngl_per_device_test[id_dense_start_test].n_part--;
+            ngl_per_device_test[id].n_layer++;
+            ngl_per_device_test[id].n_part++;
+            if (ngl_per_device_test[id_dense_start_test].n_part == 0) {
+                id_dense_start_test++;
+            }
+            ngl_per_device_test[id].overflow_type = LAYER_FRACTION_UP;
+            std::vector<ggml_backend_buffer_type_t> overflow_bufts_test = overflow_bufts;
+            if (id < nd - 1) {
+                overflow_bufts_test[id] = ggml_backend_dev_buffer_type(devs[id + 1]);
+            }
+            LLAMA_LOG_DEBUG("%s: trying to fit one extra layer with overflow_type=LAYER_FRACTION_UP\n", __func__);
+            std::vector<int64_t> mem_test = get_memory_for_layers(__func__, ngl_per_device_test, overflow_bufts_test);
+            if (mem_test[id] < targets[id] && (id + 1 == nd || mem_test[id + 1] < targets[id + 1])) {
+                ngl_per_device = ngl_per_device_test;
+                overflow_bufts = overflow_bufts_test;
+                mem            = mem_test;
+                id_dense_start = id_dense_start_test;
+                LLAMA_LOG_DEBUG("%s: set ngl_per_device[%zu].(n_layer, n_part, overflow_type)=(%" PRIu32 ", %" PRIu32 ", UP), id_dense_start=%zu\n",
+                    __func__, id, ngl_per_device[id].n_layer, ngl_per_device[id].n_part, id_dense_start);
+
+                ngl_per_device_test[id].overflow_type = LAYER_FRACTION_GATE;
+                LLAMA_LOG_DEBUG("%s: trying to fit one extra layer with overflow_type=LAYER_FRACTION_GATE\n", __func__);
+                mem_test = get_memory_for_layers(__func__, ngl_per_device_test, overflow_bufts_test);
+                if (mem_test[id] < targets[id] && (id + 1 == nd || mem_test[id + 1] < targets[id + 1])) {
+                    ngl_per_device = ngl_per_device_test;
+                    overflow_bufts = overflow_bufts_test;
+                    mem            = mem_test;
+                    id_dense_start = id_dense_start_test;
+                    LLAMA_LOG_DEBUG("%s: set ngl_per_device[%zu].(n_layer, n_part, overflow_type)=(%" PRIu32 ", %" PRIu32 ", GATE), id_dense_start=%zu\n",
+                        __func__, id, ngl_per_device[id].n_layer, ngl_per_device[id].n_part, id_dense_start);
+                }
+            } else {
+                ngl_per_device_test[id].overflow_type = LAYER_FRACTION_ATTN;
+                LLAMA_LOG_DEBUG("%s: trying to fit one extra layer with overflow_type=LAYER_FRACTION_ATTN\n", __func__);
+                mem_test = get_memory_for_layers(__func__, ngl_per_device_test, overflow_bufts_test);
+                if (mem_test[id] < targets[id] && (id + 1 == nd || mem_test[id + 1] < targets[id + 1])) {
+                    ngl_per_device = ngl_per_device_test;
+                    overflow_bufts = overflow_bufts_test;
+                    mem            = mem_test;
+                    id_dense_start = id_dense_start_test;
+                    LLAMA_LOG_DEBUG("%s: set ngl_per_device[%zu].(n_layer, n_part, overflow_type)=(%" PRIu32 ", %" PRIu32 ", ATTN), id_dense_start=%zu\n",
+                        __func__, id, ngl_per_device[id].n_layer, ngl_per_device[id].n_part, id_dense_start);
+                }
+            }
+        }
+
+        const int64_t projected_margin = dmds_full[id].free - mem[id];
+        LLAMA_LOG_INFO(
+            "%s:   - %s: %2" PRIu32 " layers (%2" PRIu32 " overflowing), %6" PRId64 " MiB used, %6" PRId64 " MiB free\n",
+            __func__, dev_names[id].c_str(), ngl_per_device[id].n_layer, ngl_per_device[id].n_part, mem[id]/MiB, projected_margin/MiB);
+    }
+
+    // print info for devices that were not changed during the conversion from dense only to full layers:
+    for (size_t id = id_dense_start + 1; id < nd; id++) {
+        const int64_t projected_margin = dmds_full[id].free - mem[id];
+        LLAMA_LOG_INFO(
+            "%s:   - %s: %2" PRIu32 " layers (%2" PRIu32 " overflowing), %6" PRId64 " MiB used, %6" PRId64 " MiB free\n",
+            __func__, dev_names[id].c_str(), ngl_per_device[id].n_layer, ngl_per_device[id].n_part, mem[id]/MiB, projected_margin/MiB);
+    }
+
+    set_ngl_tensor_split_tbo(ngl_per_device, overflow_bufts, *mparams);
+}
+
+enum llama_params_fit_status llama_params_fit(
+        const char * path_model, struct llama_model_params * mparams, struct llama_context_params * cparams,
+        float * tensor_split, struct llama_model_tensor_buft_override * tensor_buft_overrides,
+        size_t * margins, uint32_t n_ctx_min, enum ggml_log_level log_level) {
+    const int64_t t0_us = llama_time_us();
+    llama_params_fit_status status = LLAMA_PARAMS_FIT_STATUS_SUCCESS;
+    try {
+        llama_params_fit_impl(path_model, mparams, cparams, tensor_split, tensor_buft_overrides, margins, n_ctx_min, log_level);
+        LLAMA_LOG_INFO("%s: successfully fit params to free device memory\n", __func__);
+    } catch (const llama_params_fit_exception & e) {
+        LLAMA_LOG_WARN("%s: failed to fit params to free device memory: %s\n", __func__, e.what());
+        status = LLAMA_PARAMS_FIT_STATUS_FAILURE;
+    } catch (const std::runtime_error & e) {
+        LLAMA_LOG_ERROR("%s: encountered an error while trying to fit params to free device memory: %s\n", __func__, e.what());
+        status = LLAMA_PARAMS_FIT_STATUS_ERROR;
+    }
+    const int64_t t1_us = llama_time_us();
+    LLAMA_LOG_INFO("%s: fitting params to free memory took %.2f seconds\n", __func__, (t1_us - t0_us) * 1e-6);
+    return status;
 }
 
 struct llama_sampler_chain_params llama_sampler_chain_default_params() {
     struct llama_sampler_chain_params result = {
-        /*.no_perf                     =*/ true,
-    };
-
-    return result;
-}
-
-struct llama_model_quantize_params llama_model_quantize_default_params() {
-    struct llama_model_quantize_params result = {
-        /*.nthread                     =*/ 0,
-        /*.ftype                       =*/ LLAMA_FTYPE_MOSTLY_Q5_1,
-        /*.output_tensor_type          =*/ GGML_TYPE_COUNT,
-        /*.token_embedding_type        =*/ GGML_TYPE_COUNT,
-        /*.allow_requantize            =*/ false,
-        /*.quantize_output_tensor      =*/ true,
-        /*.only_copy                   =*/ false,
-        /*.pure                        =*/ false,
-        /*.keep_split                  =*/ false,
-        /*.imatrix                     =*/ nullptr,
-        /*.kv_overrides                =*/ nullptr,
+        /*.no_perf =*/ true,
     };
 
     return result;
@@ -19433,6 +20067,10 @@ struct llama_model_quantize_params llama_model_quantize_default_params() {
 
 size_t llama_max_devices(void) {
     return 16;
+}
+
+size_t llama_max_tensor_buft_overrides() {
+    return 4096;
 }
 
 bool llama_supports_mmap(void) {
@@ -19444,15 +20082,9 @@ bool llama_supports_mlock(void) {
 }
 
 bool llama_supports_gpu_offload(void) {
-#if defined(GGML_USE_VULKAN) || \
-    defined(GGML_USE_SYCL) || defined(GGML_USE_KOMPUTE)
-    // Defined when llama.cpp is compiled with support for offloading model layers to GPU.
-    return true;
-#else
     return ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU) != nullptr ||
-           ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU_FULL) != nullptr ||
+           ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_IGPU) != nullptr ||
            llama_supports_rpc();
-#endif
 }
 
 bool llama_supports_rpc(void) {
@@ -19472,21 +20104,14 @@ void llama_backend_init(void) {
 
 void llama_numa_init(enum ggml_numa_strategy numa) {
     if (numa != GGML_NUMA_STRATEGY_DISABLED) {
-        ggml_numa_init(numa);
+        auto * dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+        GGML_ASSERT(dev && "CPU backend is not loaded");
+        auto * reg = ggml_backend_dev_backend_reg(dev);
+        auto * numa_init_fn = (decltype(ggml_numa_init) *) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cpu_numa_init");
+        if (numa_init_fn) {
+            numa_init_fn(numa);
+        }
     }
-}
-
-void llama_attach_threadpool(
-             struct llama_context * ctx,
-        ggml_threadpool_t   threadpool,
-        ggml_threadpool_t   threadpool_batch) {
-    ctx->threadpool       = threadpool;
-    ctx->threadpool_batch = threadpool_batch ? threadpool_batch : threadpool;
-}
-
-void llama_detach_threadpool(struct llama_context * ctx) {
-    ctx->threadpool       = nullptr;
-    ctx->threadpool_batch = nullptr;
 }
 
 void llama_backend_free(void) {
@@ -19497,12 +20122,71 @@ int64_t llama_time_us(void) {
     return ggml_time_us();
 }
 
-struct llama_model * llama_load_model_from_file(
-        const char * path_model,
-        struct llama_model_params   params) {
+// Returns 0 on success, -1 on error, and -2 on cancellation via llama_progress_callback
+static int llama_model_load(const std::string & fname, std::vector<std::string> & splits, llama_model & model, llama_model_params & params) {
+    // loading time will be recalculated after the first eval, so
+    // we take page faults deferred by mmap() into consideration
+    model.t_load_us = 0;
+    time_meas tm(model.t_load_us);
+
+    model.t_start_us = tm.t_start_us;
+
+    try {
+        llama_model_loader ml(fname, splits, params.use_mmap, params.use_direct_io, params.check_tensors, params.no_alloc, params.kv_overrides, params.tensor_buft_overrides);
+
+        ml.print_info();
+
+        model.hparams.vocab_only = params.vocab_only;
+        model.hparams.no_alloc   = params.no_alloc;
+
+        try {
+            model.load_arch(ml);
+        } catch(const std::exception & e) {
+            throw std::runtime_error("error loading model architecture: " + std::string(e.what()));
+        }
+        try {
+            model.load_hparams(ml);
+        } catch(const std::exception & e) {
+            throw std::runtime_error("error loading model hyperparameters: " + std::string(e.what()));
+        }
+        if (model.arch == LLM_ARCH_CLIP) {
+            throw std::runtime_error("CLIP cannot be used as main model, use it with --mmproj instead");
+        }
+        try {
+            model.load_vocab(ml);
+        } catch(const std::exception & e) {
+            throw std::runtime_error("error loading model vocabulary: " + std::string(e.what()));
+        }
+
+        model.load_stats(ml);
+        model.print_info();
+
+        if (params.vocab_only) {
+            LLAMA_LOG_INFO("%s: vocab only - skipping tensors\n", __func__);
+            return 0;
+        }
+
+        if (!model.load_tensors(ml)) {
+            return -2;
+        }
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: error loading model: %s\n", __func__, err.what());
+        return -1;
+    }
+
+    return 0;
+}
+
+static struct llama_model * llama_model_load_from_file_impl(
+        const std::string & path_model,
+        std::vector<std::string> & splits,
+        struct llama_model_params params) {
     ggml_time_init();
 
-    llama_model * model = new llama_model;
+    if (!params.vocab_only && ggml_backend_reg_count() == 0) {
+        LLAMA_LOG_ERROR("%s: no backends are loaded. hint: use ggml_backend_load() or ggml_backend_load_all() to load a backend before calling this function\n", __func__);
+        return nullptr;
+    }
 
     unsigned cur_percentage = 0;
     if (params.progress_callback == NULL) {
@@ -19521,67 +20205,103 @@ struct llama_model * llama_load_model_from_file(
         };
     }
 
-    if (params.rpc_servers != nullptr && params.rpc_servers[0] != '\0') {
-        // split the servers set them into model->rpc_servers
-        std::string servers(params.rpc_servers);
-        size_t pos = 0;
-        while ((pos = servers.find(',')) != std::string::npos) {
-            std::string server = servers.substr(0, pos);
-            model->rpc_servers.push_back(server);
-            servers.erase(0, pos + 1);
-        }
-        model->rpc_servers.push_back(servers);
-    }
-
-    // add RPC devices
-    if (!model->rpc_servers.empty()) {
-        ggml_backend_reg_t rpc_reg = ggml_backend_reg_by_name("RPC");
-        if (!rpc_reg) {
-            LLAMA_LOG_ERROR("%s: failed to find RPC backend\n", __func__);
-            llama_free_model(model);
-            return nullptr;
-        }
-
-        // ggml_backend_dev_t ggml_backend_rpc_add_device(const char * endpoint);
-        using ggml_backend_rpc_add_device_t = ggml_backend_dev_t (*)(const char *);
-        ggml_backend_rpc_add_device_t ggml_backend_rpc_add_device_fn = (ggml_backend_rpc_add_device_t) ggml_backend_reg_get_proc_address(rpc_reg, "ggml_backend_rpc_add_device");
-        if (!ggml_backend_rpc_add_device_fn) {
-            LLAMA_LOG_ERROR("%s: failed to find RPC device add function\n", __func__);
-            llama_free_model(model);
-            return nullptr;
-        }
-
-        for (const std::string & server : model->rpc_servers) {
-            ggml_backend_dev_t dev = ggml_backend_rpc_add_device_fn(server.c_str());
-            if (dev) {
-                model->devices.push_back(dev);
-            } else {
-                LLAMA_LOG_ERROR("%s: failed to add RPC device for server '%s'\n", __func__, server.c_str());
-                llama_free_model(model);
-                return nullptr;
-            }
-        }
-    }
+    llama_model * model = new llama_model(params);
 
     // create list of devices to use with this model
-    // currently, we use all available devices
-    // TODO: rework API to give user more control over device selection
-    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
-        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
-        switch (ggml_backend_dev_type(dev)) {
-            case GGML_BACKEND_DEVICE_TYPE_CPU:
-            case GGML_BACKEND_DEVICE_TYPE_CPU_FULL:
-                // skip CPU backends since they are `handled separately
-                break;
+    if (params.devices) {
+        for (ggml_backend_dev_t * dev = params.devices; *dev; ++dev) {
+            model->devices.push_back(*dev);
+        }
+    } else {
+        // default device selection
 
-            case GGML_BACKEND_DEVICE_TYPE_GPU:
-            case GGML_BACKEND_DEVICE_TYPE_GPU_FULL:
-                model->devices.push_back(dev);
-                break;
+        // build list of available devices
+        std::vector<ggml_backend_dev_t> gpus;
+        std::vector<ggml_backend_dev_t> igpus;
+        std::vector<ggml_backend_dev_t> rpc_servers;
+
+        for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+            ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+            switch (ggml_backend_dev_type(dev)) {
+                case GGML_BACKEND_DEVICE_TYPE_CPU:
+                case GGML_BACKEND_DEVICE_TYPE_ACCEL:
+                    // skip CPU backends since they are handled separately
+                    break;
+
+                case GGML_BACKEND_DEVICE_TYPE_GPU: {
+                    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+                    if (ggml_backend_reg_name(reg) == std::string("RPC")) {
+                        rpc_servers.push_back(dev);
+                    } else {
+                        // check if there is already a GPU with the same device id
+                        ggml_backend_dev_props props;
+                        ggml_backend_dev_get_props(dev, &props);
+                        auto it = std::find_if(gpus.begin(), gpus.end(), [&props](ggml_backend_dev_t d) {
+                            ggml_backend_dev_props d_props;
+                            ggml_backend_dev_get_props(d, &d_props);
+                            if (props.device_id && d_props.device_id) {
+                                return strcmp(props.device_id, d_props.device_id) == 0;
+                            }
+                            return false;
+                        });
+
+                        if (it != gpus.end()) {
+                            LLAMA_LOG_INFO("%s: skipping device %s (%s) with id %s - already using device %s (%s) with the same id\n",
+                                    __func__,
+                                    ggml_backend_dev_name(dev), ggml_backend_dev_description(dev),
+                                    props.device_id ? props.device_id : "unknown id",
+                                    ggml_backend_dev_name(*it), ggml_backend_dev_description(*it));
+                        } else {
+                            gpus.push_back(dev);
+                        }
+                    }
+                    break;
+                }
+
+                case GGML_BACKEND_DEVICE_TYPE_IGPU:
+                    igpus.push_back(dev);
+                    break;
+            }
+        }
+
+        // add RPC servers at the front of the list to minimize network transfers
+        model->devices.insert(model->devices.begin(), rpc_servers.begin(), rpc_servers.end());
+
+        // add GPUs
+        model->devices.insert(model->devices.end(), gpus.begin(), gpus.end());
+
+        // add integrated GPUs only if no other devices were found
+        if (model->devices.empty()) {
+            model->devices.insert(model->devices.end(), igpus.begin(), igpus.end());
         }
     }
 
-    int status = llama_model_load(path_model, *model, params);
+    // if using single GPU mode, remove all except the main GPU
+    if (params.split_mode == LLAMA_SPLIT_MODE_NONE) {
+        if (params.main_gpu < 0) {
+            model->devices.clear();
+        } else {
+            if (params.main_gpu >= (int)model->devices.size()) {
+                LLAMA_LOG_ERROR("%s: invalid value for main_gpu: %d (available devices: %zu)\n", __func__, params.main_gpu, model->devices.size());
+                llama_model_free(model);
+                return nullptr;
+            }
+            ggml_backend_dev_t main_gpu = model->devices[params.main_gpu];
+            model->devices.clear();
+            model->devices.push_back(main_gpu);
+        }
+    }
+
+    for (auto * dev : model->devices) {
+        ggml_backend_dev_props props;
+        ggml_backend_dev_get_props(dev, &props);
+        LLAMA_LOG_INFO("%s: using device %s (%s) (%s) - %zu MiB free\n", __func__,
+                ggml_backend_dev_name(dev), ggml_backend_dev_description(dev),
+                props.device_id ? props.device_id : "unknown id",
+                props.memory_free/1024/1024);
+    }
+
+    const int status = llama_model_load(path_model, splits, *model, params);
     GGML_ASSERT(status <= 0);
     if (status < 0) {
         if (status == -1) {
@@ -19589,7 +20309,8 @@ struct llama_model * llama_load_model_from_file(
         } else if (status == -2) {
             LLAMA_LOG_INFO("%s: cancelled model load\n", __func__);
         }
-        llama_free_model(model);
+
+        llama_model_free(model);
         return nullptr;
     }
 
@@ -20511,1357 +21232,40 @@ void llama_kv_cache_update(struct llama_context * ctx) {
 }
 
 // deprecated
-size_t llama_get_state_size(struct llama_context * ctx) {
-    return llama_state_get_size(ctx);
+struct llama_model * llama_load_model_from_file(
+        const char * path_model,
+        struct llama_model_params params) {
+    return llama_model_load_from_file(path_model, params);
 }
 
-// deprecated
-size_t llama_copy_state_data(struct llama_context * ctx, uint8_t * dst) {
-    return llama_state_get_data(ctx, dst, -1);
+struct llama_model * llama_model_load_from_file(
+        const char * path_model,
+        struct llama_model_params params) {
+    std::vector<std::string> splits = {};
+    return llama_model_load_from_file_impl(path_model, splits, params);
 }
 
-// deprecated
-size_t llama_set_state_data(struct llama_context * ctx, const uint8_t * src) {
-    return llama_state_set_data(ctx, src, -1);
-}
-
-// deprecated
-bool llama_load_session_file(struct llama_context * ctx, const char * path_session, llama_token * tokens_out, size_t n_token_capacity, size_t * n_token_count_out) {
-    return llama_state_load_file(ctx, path_session, tokens_out, n_token_capacity, n_token_count_out);
-}
-
-// deprecated
-bool llama_save_session_file(struct llama_context * ctx, const char * path_session, const llama_token * tokens, size_t n_token_count) {
-    return llama_state_save_file(ctx, path_session, tokens, n_token_count);
-}
-
-// TODO: replace all non-fatal assertions with returned errors or exceptions
-struct llama_data_write {
-    virtual void write(const void * src, size_t size) = 0;
-    virtual void write_tensor_data(const struct ggml_tensor * tensor, size_t offset, size_t size) = 0;
-    virtual size_t get_size_written() = 0;
-    virtual ~llama_data_write() = default;
-
-    void write_string(const std::string & str) {
-        uint32_t str_size = str.size();
-
-        write(&str_size,  sizeof(str_size));
-        write(str.data(), str_size);
-    }
-
-    void write_model_info(const struct llama_context * ctx) {
-        std::string arch_str = LLM_ARCH_NAMES.at(ctx->model.arch);
-        write_string(arch_str);
-        // TODO: add more model-specific info which should prevent loading the session file if not identical
-    }
-
-    //void write_rng(const std::mt19937 & rng) {
-    //    std::ostringstream rng_ss;
-    //    rng_ss << rng;
-
-    //    const std::string & rng_str = rng_ss.str();
-
-    //    write_string(rng_str);
-    //}
-
-    void write_output_ids(struct llama_context * ctx) {
-        llama_output_reorder(ctx);
-
-        const uint32_t n_outputs = ctx->n_outputs;
-
-        std::vector<int32_t> output_pos;
-
-        const size_t    n_batch = ctx->cparams.n_batch;
-        const auto & output_ids = ctx->output_ids;
-
-        GGML_ASSERT(n_outputs <= ctx->output_size);
-
-        output_pos.resize(n_outputs);
-
-        // build a more compact representation of the output ids
-        for (size_t i = 0; i < n_batch; ++i) {
-            // map an output id to a position in the batch
-            int32_t pos = output_ids[i];
-            if (pos >= 0) {
-                GGML_ASSERT((uint32_t) pos < n_outputs);
-                output_pos[pos] = i;
-            }
-        }
-
-        write(&n_outputs, sizeof(n_outputs));
-
-        if (n_outputs) {
-            write(output_pos.data(), n_outputs * sizeof(int32_t));
-        }
-    }
-
-    void write_logits(const struct llama_context * ctx) {
-        const uint64_t logits_size = std::min((uint64_t) ctx->logits_size, (uint64_t) ctx->n_outputs * ctx->model.hparams.n_vocab);
-
-        write(&logits_size, sizeof(logits_size));
-
-        if (logits_size) {
-            write(ctx->logits, logits_size * sizeof(float));
-        }
-    }
-
-    void write_embeddings(const struct llama_context * ctx) {
-        const uint64_t embeddings_size = std::min((uint64_t) ctx->embd_size, (uint64_t) ctx->n_outputs * ctx->model.hparams.n_embd);
-
-        write(&embeddings_size, sizeof(embeddings_size));
-
-        if (embeddings_size) {
-            write(ctx->embd, embeddings_size * sizeof(float));
-        }
-    }
-
-    void write_kv_cache_meta(const llama_kv_cache & kv_self, const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges, llama_seq_id seq_id = -1) {
-
-        for (const auto & range : cell_ranges) {
-            for (uint32_t i = range.first; i < range.second; ++i) {
-                const auto & cell = kv_self.cells[i];
-                const llama_pos pos      = cell.pos;
-                const uint32_t  n_seq_id = seq_id == -1 ? cell.seq_id.size() : 0;
-
-                write(&pos,      sizeof(pos));
-                write(&n_seq_id, sizeof(n_seq_id));
-
-                if (n_seq_id) {
-                    for (auto seq_id : cell.seq_id) {
-                        write(&seq_id, sizeof(seq_id));
-                    }
-                }
-            }
-        }
-    }
-
-    void write_kv_cache_data(const struct llama_context * ctx, const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges) {
-        const struct llama_kv_cache & kv_self = ctx->kv_self;
-        const struct llama_hparams & hparams = ctx->model.hparams;
-
-        const uint32_t v_trans = kv_self.v_trans ? 1 : 0;
-        const uint32_t n_layer = hparams.n_layer;
-
-        write(&v_trans, sizeof(v_trans));
-        write(&n_layer, sizeof(n_layer));
-
-        std::vector<uint8_t> tmp_buf;
-
-        // Iterate and write all the keys first, each row is a cell
-        // Get whole range at a time
-        for (uint32_t il = 0; il < n_layer; ++il) {
-            const uint32_t n_embd_k_gqa = hparams.n_embd_k_gqa(il) + hparams.n_embd_k_s();
-
-            // Write key type
-            const int32_t k_type_i = (int32_t)kv_self.k_l[il]->type;
-            write(&k_type_i, sizeof(k_type_i));
-
-            // Write row size of key
-            const uint64_t k_size_row = ggml_row_size(kv_self.k_l[il]->type, n_embd_k_gqa);
-            write(&k_size_row, sizeof(k_size_row));
-
-            // Read each range of cells of k_size length each into tmp_buf and write out
-            for (const auto & range : cell_ranges) {
-                const size_t range_size = range.second - range.first;
-                const size_t buf_size = range_size * k_size_row;
-                write_tensor_data(kv_self.k_l[il], range.first * k_size_row, buf_size);
-            }
-        }
-
-        if (!kv_self.v_trans) {
-            for (uint32_t il = 0; il < n_layer; ++il) {
-                const uint32_t n_embd_v_gqa = hparams.n_embd_v_gqa(il) + hparams.n_embd_v_s();
-
-                // Write value type
-                const int32_t v_type_i = (int32_t)kv_self.v_l[il]->type;
-                write(&v_type_i, sizeof(v_type_i));
-
-                // Write row size of value
-                const uint64_t v_size_row = ggml_row_size(kv_self.v_l[il]->type, n_embd_v_gqa);
-                write(&v_size_row, sizeof(v_size_row));
-
-                // Read each range of cells of v_size length each into tmp_buf and write out
-                for (const auto & range : cell_ranges) {
-                    const size_t range_size = range.second - range.first;
-                    const size_t buf_size = range_size * v_size_row;
-                    write_tensor_data(kv_self.v_l[il], range.first * v_size_row, buf_size);
-                }
-            }
-        } else {
-            // When v is transposed, we also need the element size and get the element ranges from each row
-            const uint32_t kv_size = kv_self.size;
-            for (uint32_t il = 0; il < n_layer; ++il) {
-                const uint32_t n_embd_v_gqa = hparams.n_embd_v_gqa(il) + hparams.n_embd_v_s();
-
-                // Write value type
-                const int32_t v_type_i = (int32_t)kv_self.v_l[il]->type;
-                write(&v_type_i, sizeof(v_type_i));
-
-                // Write element size
-                const uint32_t v_size_el = ggml_type_size(kv_self.v_l[il]->type);
-                write(&v_size_el, sizeof(v_size_el));
-
-                // Write GQA embedding size
-                write(&n_embd_v_gqa, sizeof(n_embd_v_gqa));
-
-                // For each row, we get the element values of each cell
-                for (uint32_t j = 0; j < n_embd_v_gqa; ++j) {
-                    // Read each range of cells of v_size_el length each into tmp_buf and write out
-                    for (const auto & range : cell_ranges) {
-                        const size_t range_size = range.second - range.first;
-                        const size_t src_offset = (range.first + j * kv_size) * v_size_el;
-                        const size_t buf_size = range_size * v_size_el;
-                        write_tensor_data(kv_self.v_l[il], src_offset, buf_size);
-                    }
-                }
-            }
-        }
-    }
-
-    void write_kv_cache(const struct llama_context * ctx, llama_seq_id seq_id = -1) {
-        const struct llama_kv_cache & kv_self = ctx->kv_self;
-        std::vector<std::pair<uint32_t, uint32_t>> cell_ranges; // ranges, from inclusive, to exclusive
-        uint32_t cell_count = 0;
-
-        // Count the number of cells with the specified seq_id
-        // Find all the ranges of cells with this seq id (or all, when -1)
-        uint32_t cell_range_begin = kv_self.size;
-        for (uint32_t i = 0; i < kv_self.size; ++i) {
-            const auto & cell = kv_self.cells[i];
-            if ((seq_id == -1 && !cell.is_empty()) || cell.has_seq_id(seq_id)) {
-                ++cell_count;
-                if (cell_range_begin == kv_self.size) {
-                    cell_range_begin = i;
-                }
-            } else {
-                if (cell_range_begin != kv_self.size) {
-                    cell_ranges.emplace_back(cell_range_begin, i);
-                    cell_range_begin = kv_self.size;
-                }
-            }
-        }
-        if (cell_range_begin != kv_self.size) {
-            cell_ranges.emplace_back(cell_range_begin, kv_self.size);
-        }
-
-        // DEBUG CHECK: Sum of cell counts in ranges should equal the total cell count
-        uint32_t cell_count_check = 0;
-        for (const auto & range : cell_ranges) {
-            cell_count_check += range.second - range.first;
-        }
-        GGML_ASSERT(cell_count == cell_count_check);
-
-        write(&cell_count, sizeof(cell_count));
-
-        write_kv_cache_meta(kv_self, cell_ranges, seq_id);
-        write_kv_cache_data(ctx, cell_ranges);
-    }
-};
-
-struct llama_data_read {
-    virtual const uint8_t * read(size_t size) = 0;
-    virtual void read_to(void * dst, size_t size) = 0;
-    virtual size_t get_size_read() = 0;
-    virtual ~llama_data_read() = default;
-
-    void read_string(std::string & str) {
-        uint32_t str_size;
-        read_to(&str_size, sizeof(str_size));
-
-        str.assign((const char *) read(str_size), str_size);
-    }
-
-    // validate model information
-    void read_model_info(const struct llama_context * ctx) {
-        std::string cur_arch_str = LLM_ARCH_NAMES.at(ctx->model.arch);
-        std::string arch_str;
-        read_string(arch_str);
-        if (cur_arch_str != arch_str) {
-            throw std::runtime_error(format("wrong model arch: '%s' instead of '%s'", arch_str.c_str(), cur_arch_str.c_str()));
-        }
-        // TODO: add more info which needs to be identical but which is not verified otherwise
-    }
-
-    //void read_rng(std::mt19937 & rng) {
-    //    std::string rng_str;
-    //    read_string(rng_str);
-
-    //    std::istringstream rng_ss(rng_str);
-    //    rng_ss >> rng;
-
-    //    if (rng_ss.fail()) {
-    //        throw std::runtime_error("failed to load RNG state");
-    //    }
-    //}
-
-    void read_output_ids(struct llama_context * ctx) {
-        std::vector<int32_t> output_pos;
-
-        uint32_t n_outputs;
-        read_to(&n_outputs, sizeof(n_outputs));
-
-        if (n_outputs > llama_output_reserve(*ctx, n_outputs)) {
-            throw std::runtime_error("could not reserve outputs");
-        }
-
-        if (n_outputs) {
-            output_pos.resize(n_outputs);
-            read_to(output_pos.data(), n_outputs * sizeof(int32_t));
-
-            for (int32_t i = 0; i < (int32_t) output_pos.size(); ++i) {
-                int32_t id = output_pos[i];
-                if ((uint32_t) id >= ctx->cparams.n_batch) {
-                    throw std::runtime_error(format("invalid output id, %d does not fit in batch size of %u", id, ctx->cparams.n_batch));
-                }
-                ctx->output_ids[id] = i;
-            }
-
-            ctx->n_outputs = n_outputs;
-        }
-    }
-
-    void read_logits(struct llama_context * ctx) {
-        uint64_t logits_size;
-        read_to(&logits_size, sizeof(logits_size));
-
-        if (ctx->logits_size < logits_size) {
-            throw std::runtime_error("logits buffer too small");
-        }
-
-        if (logits_size) {
-            read_to(ctx->logits, logits_size * sizeof(float));
-        }
-    }
-
-    void read_embeddings(struct llama_context * ctx) {
-        uint64_t embeddings_size;
-        read_to(&embeddings_size, sizeof(embeddings_size));
-
-        if (ctx->embd_size < embeddings_size) {
-            throw std::runtime_error("embeddings buffer too small");
-        }
-
-        if (embeddings_size) {
-            read_to(ctx->embd, embeddings_size * sizeof(float));
-        }
-    }
-
-    bool read_kv_cache_meta(struct llama_context * ctx, uint32_t cell_count, llama_seq_id dest_seq_id = -1) {
-        struct llama_kv_cache & kv_self = ctx->kv_self;
-
-        if (dest_seq_id != -1) {
-            // single sequence
-
-            llama_kv_cache_seq_rm(kv_self, dest_seq_id, -1, -1);
-
-            llama_ubatch batch = ctx->sbatch.reserve_ubatch(cell_count, /* has_embd */ false);
-            batch.n_tokens = cell_count;
-            batch.n_seq_tokens = cell_count;
-            batch.n_seqs = 1;
-
-            for (uint32_t i = 0; i < cell_count; ++i) {
-                llama_pos pos;
-                uint32_t n_seq_id;
-
-                read_to(&pos, sizeof(pos));
-                read_to(&n_seq_id, sizeof(n_seq_id));
-
-                if (n_seq_id != 0) {
-                    LLAMA_LOG_ERROR("%s: invalid seq_id-agnostic kv cell\n", __func__);
-                    return false;
-                }
-
-                batch.pos[i] = pos;
-            }
-            batch.n_seq_id[0] = 1;
-            batch.seq_id[0] = &dest_seq_id;
-            if (!llama_kv_cache_find_slot(kv_self, batch)) {
-                LLAMA_LOG_ERROR("%s: failed to find available cells in kv cache\n", __func__);
-                return false;
-            }
-
-            // DEBUG CHECK: kv_self.head should be our first cell, kv_self.head + cell_count - 1 should be our last cell (verify seq_id and pos values)
-            // Assume that this is one contiguous block of cells
-            GGML_ASSERT(kv_self.head + cell_count <= kv_self.size);
-            GGML_ASSERT(kv_self.cells[kv_self.head].pos == batch.pos[0]);
-            GGML_ASSERT(kv_self.cells[kv_self.head + cell_count - 1].pos == batch.pos[cell_count - 1]);
-            GGML_ASSERT(kv_self.cells[kv_self.head].has_seq_id(dest_seq_id));
-            GGML_ASSERT(kv_self.cells[kv_self.head + cell_count - 1].has_seq_id(dest_seq_id));
-        } else {
-            // whole KV cache restore
-
-            if (cell_count > kv_self.size) {
-                LLAMA_LOG_ERROR("%s: not enough cells in kv cache\n", __func__);
-                return false;
-            }
-
-            llama_kv_cache_clear(kv_self);
-
-            for (uint32_t i = 0; i < cell_count; ++i) {
-                llama_kv_cell & cell = kv_self.cells[i];
-
-                llama_pos pos;
-                uint32_t  n_seq_id;
-
-                read_to(&pos,      sizeof(pos));
-                read_to(&n_seq_id, sizeof(n_seq_id));
-
-                cell.pos = pos;
-
-                for (uint32_t j = 0; j < n_seq_id; ++j) {
-                    llama_seq_id seq_id;
-                    read_to(&seq_id, sizeof(seq_id));
-
-                    if (seq_id < 0 || (uint32_t) seq_id >= llama_n_seq_max(ctx)) {
-                        LLAMA_LOG_ERROR("%s: invalid seq_id, %d is out of range [0, %u)\n", __func__, seq_id, llama_n_seq_max(ctx));
-                        return false;
-                    }
-
-                    cell.seq_id.insert(seq_id);
-
-                    if (kv_self.recurrent) {
-                        int32_t & tail = kv_self.cells[seq_id].tail;
-                        if (tail != -1) {
-                            LLAMA_LOG_ERROR("%s: duplicate tail for seq_id %d in cell %d and %d\n", __func__, seq_id, i, tail);
-                            return false;
-                        }
-                        tail = i;
-                    }
-                }
-            }
-
-            kv_self.head = 0;
-            kv_self.used = cell_count;
-        }
-
-        if (kv_self.recurrent) {
-            for (uint32_t i = 0; i < cell_count; ++i) {
-                uint32_t cell_id = kv_self.head + i;
-                // make sure the recurrent states will keep their restored state
-                kv_self.cells[cell_id].src = cell_id;
-            }
-        }
-
-        return true;
-    }
-
-    bool read_kv_cache_data(struct llama_context * ctx, uint32_t cell_count) {
-        const struct llama_hparams & hparams = ctx->model.hparams;
-        struct llama_kv_cache & kv_self = ctx->kv_self;
-        uint32_t v_trans;
-        uint32_t n_layer;
-        read_to(&v_trans, sizeof(v_trans));
-        read_to(&n_layer, sizeof(n_layer));
-
-        if (n_layer != hparams.n_layer) {
-            LLAMA_LOG_ERROR("%s: mismatched layer count (%u instead of %u)\n", __func__, n_layer, hparams.n_layer);
-            return false;
-        }
-        if (cell_count > kv_self.size) {
-            LLAMA_LOG_ERROR("%s: not enough cells in kv cache to restore state (%u > %u)\n", __func__, cell_count, kv_self.size);
-            return false;
-        }
-        if (kv_self.v_trans != (bool) v_trans) {
-            LLAMA_LOG_ERROR("%s: incompatible V transposition\n", __func__);
-            return false;
-        }
-
-        // For each layer, read the keys for each cell, one row is one cell, read as one contiguous block
-        for (uint32_t il = 0; il < n_layer; ++il) {
-            const uint32_t n_embd_k_gqa = hparams.n_embd_k_gqa(il) + hparams.n_embd_k_s();
-
-            // Read type of key
-            int32_t k_type_i_ref;
-            read_to(&k_type_i_ref, sizeof(k_type_i_ref));
-            const int32_t k_type_i = (int32_t)kv_self.k_l[il]->type;
-            if (k_type_i != k_type_i_ref) {
-                LLAMA_LOG_ERROR("%s: mismatched key type (%d != %d, layer %d)\n", __func__, k_type_i, k_type_i_ref, il);
-                return false;
-            }
-
-            // Read row size of key
-            uint64_t k_size_row_ref;
-            read_to(&k_size_row_ref, sizeof(k_size_row_ref));
-            const size_t k_size_row = ggml_row_size(kv_self.k_l[il]->type, n_embd_k_gqa);
-            if (k_size_row != k_size_row_ref) {
-                LLAMA_LOG_ERROR("%s: mismatched key row size (%zu != %zu, layer %d)\n", __func__, k_size_row, (size_t) k_size_row_ref, il);
-                return false;
-            }
-
-            if (cell_count) {
-                // Read and set the keys for the whole cell range
-                ggml_backend_tensor_set(kv_self.k_l[il], read(cell_count * k_size_row), kv_self.head * k_size_row, cell_count * k_size_row);
-            }
-        }
-
-        if (!kv_self.v_trans) {
-            for (uint32_t il = 0; il < n_layer; ++il) {
-                const uint32_t n_embd_v_gqa = hparams.n_embd_v_gqa(il) + hparams.n_embd_v_s();
-
-                // Read type of value
-                int32_t v_type_i_ref;
-                read_to(&v_type_i_ref, sizeof(v_type_i_ref));
-                const int32_t v_type_i = (int32_t)kv_self.v_l[il]->type;
-                if (v_type_i != v_type_i_ref) {
-                    LLAMA_LOG_ERROR("%s: mismatched value type (%d != %d, layer %d)\n", __func__, v_type_i, v_type_i_ref, il);
-                    return false;
-                }
-
-                // Read row size of value
-                uint64_t v_size_row_ref;
-                read_to(&v_size_row_ref, sizeof(v_size_row_ref));
-                const size_t v_size_row = ggml_row_size(kv_self.v_l[il]->type, n_embd_v_gqa);
-                if (v_size_row != v_size_row_ref) {
-                    LLAMA_LOG_ERROR("%s: mismatched value row size (%zu != %zu, layer %d)\n", __func__, v_size_row, (size_t) v_size_row_ref, il);
-                    return false;
-                }
-
-                if (cell_count) {
-                    // Read and set the values for the whole cell range
-                    ggml_backend_tensor_set(kv_self.v_l[il], read(cell_count * v_size_row), kv_self.head * v_size_row, cell_count * v_size_row);
-                }
-            }
-        } else {
-            // For each layer, read the values for each cell (transposed)
-            for (uint32_t il = 0; il < n_layer; ++il) {
-                const uint32_t n_embd_v_gqa = hparams.n_embd_v_gqa(il) + hparams.n_embd_v_s();
-
-                // Read type of value
-                int32_t v_type_i_ref;
-                read_to(&v_type_i_ref, sizeof(v_type_i_ref));
-                const int32_t v_type_i = (int32_t)kv_self.v_l[il]->type;
-                if (v_type_i != v_type_i_ref) {
-                    LLAMA_LOG_ERROR("%s: mismatched value type (%d != %d, layer %d)\n", __func__, v_type_i, v_type_i_ref, il);
-                    return false;
-                }
-
-                // Read element size of value
-                uint32_t v_size_el_ref;
-                read_to(&v_size_el_ref, sizeof(v_size_el_ref));
-                const size_t v_size_el = ggml_type_size(kv_self.v_l[il]->type);
-                if (v_size_el != v_size_el_ref) {
-                    LLAMA_LOG_ERROR("%s: mismatched value element size (%zu != %zu, layer %d)\n", __func__, v_size_el, (size_t) v_size_el_ref, il);
-                    return false;
-                }
-
-                // Read GQA embedding size
-                uint32_t n_embd_v_gqa_ref;
-                read_to(&n_embd_v_gqa_ref, sizeof(n_embd_v_gqa_ref));
-                if (n_embd_v_gqa != n_embd_v_gqa_ref) {
-                    LLAMA_LOG_ERROR("%s: mismatched GQA embedding size (%u != %u, layer %d)\n", __func__, n_embd_v_gqa, n_embd_v_gqa_ref, il);
-                    return false;
-                }
-
-                if (cell_count) {
-                    // For each row in the transposed matrix, read the values for the whole cell range
-                    for (uint32_t j = 0; j < n_embd_v_gqa; ++j) {
-                        const size_t dst_offset = (kv_self.head + j * kv_self.size) * v_size_el;
-                        ggml_backend_tensor_set(kv_self.v_l[il], read(cell_count * v_size_el), dst_offset, cell_count * v_size_el);
-                    }
-                }
-            }
-        }
-        return true;
-    }
-
-    void read_kv_cache(struct llama_context * ctx, llama_seq_id seq_id = -1) {
-        uint32_t cell_count;
-        read_to(&cell_count, sizeof(cell_count));
-
-        bool res = read_kv_cache_meta(ctx, cell_count, seq_id) && read_kv_cache_data(ctx, cell_count);
-
-        if (!res) {
-            if (seq_id == -1) {
-                llama_kv_cache_clear(ctx);
-            } else {
-                llama_kv_cache_seq_rm(ctx, seq_id, -1, -1);
-            }
-            throw std::runtime_error("failed to restore kv cache");
-        }
-    }
-};
-
-struct llama_data_write_dummy : llama_data_write {
-    size_t size_written = 0;
-
-    llama_data_write_dummy() {}
-
-    void write(const void * /* src */, size_t size) override {
-        size_written += size;
-    }
-
-    void write_tensor_data(const struct ggml_tensor * /* tensor */, size_t /* offset */, size_t size) override {
-        size_written += size;
-    }
-
-    size_t get_size_written() override {
-        return size_written;
-    }
-};
-
-struct llama_data_write_buffer : llama_data_write {
-    uint8_t * ptr;
-    size_t buf_size = 0;
-    size_t size_written = 0;
-
-    llama_data_write_buffer(uint8_t * p, size_t len) : ptr(p), buf_size(len) {}
-
-    void write(const void * src, size_t size) override {
-        if (size > buf_size) {
-            throw std::runtime_error("unexpectedly reached end of buffer");
-        }
-        memcpy(ptr, src, size);
-        ptr += size;
-        size_written += size;
-        buf_size -= size;
-    }
-
-    void write_tensor_data(const struct ggml_tensor * tensor, size_t offset, size_t size) override {
-        if (size > buf_size) {
-            throw std::runtime_error("unexpectedly reached end of buffer");
-        }
-        ggml_backend_tensor_get(tensor, ptr, offset, size);
-        ptr += size;
-        size_written += size;
-        buf_size -= size;
-    }
-
-    size_t get_size_written() override {
-        return size_written;
-    }
-};
-
-struct llama_data_read_buffer : llama_data_read {
-    const uint8_t * ptr;
-    size_t buf_size = 0;
-    size_t size_read = 0;
-
-    llama_data_read_buffer(const uint8_t * p, size_t len) : ptr(p), buf_size(len) {}
-
-    const uint8_t * read(size_t size) override {
-        const uint8_t * base_ptr = ptr;
-        if (size > buf_size) {
-            throw std::runtime_error("unexpectedly reached end of buffer");
-        }
-        ptr += size;
-        size_read += size;
-        buf_size -= size;
-        return base_ptr;
-    }
-
-    void read_to(void * dst, size_t size) override {
-        memcpy(dst, read(size), size);
-    }
-
-    size_t get_size_read() override {
-        return size_read;
-    }
-};
-
-struct llama_data_write_file : llama_data_write {
-    llama_file * file;
-    size_t size_written = 0;
-    std::vector<uint8_t> temp_buffer;
-
-    llama_data_write_file(llama_file * f) : file(f) {}
-
-    void write(const void * src, size_t size) override {
-        file->write_raw(src, size);
-        size_written += size;
-    }
-
-    void write_tensor_data(const struct ggml_tensor * tensor, size_t offset, size_t size) override {
-        temp_buffer.resize(size);
-        ggml_backend_tensor_get(tensor, temp_buffer.data(), offset, size);
-        write(temp_buffer.data(), temp_buffer.size());
-    }
-
-    size_t get_size_written() override {
-        return size_written;
-    }
-};
-
-struct llama_data_read_file : llama_data_read {
-    llama_file * file;
-    size_t size_read = 0;
-    std::vector<uint8_t> temp_buffer;
-
-    llama_data_read_file(llama_file * f) : file(f) {}
-
-    void read_to(void * dst, size_t size) override {
-        file->read_raw(dst, size);
-        size_read += size;
-    }
-
-    const uint8_t * read(size_t size) override {
-        temp_buffer.resize(size);
-        read_to(temp_buffer.data(), size);
-        return temp_buffer.data();
-    }
-
-    size_t get_size_read() override {
-        return size_read;
-    }
-};
-
-/** copy state data into either a buffer or file depending on the passed in context
- *
- * file context:
- * llama_file file("/path", "wb");
- * llama_data_write_file data_ctx(&file);
- * llama_state_get_data_internal(ctx, data_ctx);
- *
- * buffer context:
- * std::vector<uint8_t> buf(max_size, 0);
- * llama_data_write_buffer data_ctx(buf.data(), max_size);
- * llama_state_get_data_internal(ctx, data_ctx);
- *
-*/
-static size_t llama_state_get_data_internal(struct llama_context * ctx, llama_data_write & data_ctx) {
-    llama_synchronize(ctx);
-
-    data_ctx.write_model_info(ctx);
-
-    // copy outputs
-    data_ctx.write_output_ids(ctx);
-    data_ctx.write_logits(ctx);
-    data_ctx.write_embeddings(ctx);
-
-    data_ctx.write_kv_cache(ctx);
-
-    return data_ctx.get_size_written();
-}
-
-size_t llama_state_get_data(struct llama_context * ctx, uint8_t * dst, size_t size) {
-    llama_data_write_buffer data_ctx(dst, size);
-    try {
-        return llama_state_get_data_internal(ctx, data_ctx);
-    } catch (const std::exception & err) {
-        LLAMA_LOG_ERROR("%s: error saving state: %s\n", __func__, err.what());
-        return 0;
-    }
-}
-
-// Returns the *actual* size of the state.
-// Intended to be used when saving to state to a buffer.
-size_t llama_state_get_size(struct llama_context * ctx) {
-    llama_data_write_dummy data_ctx;
-    try {
-        return llama_state_get_data_internal(ctx, data_ctx);
-    } catch (const std::exception & err) {
-        LLAMA_LOG_ERROR("%s: error getting state size: %s\n", __func__, err.what());
-        return 0;
-    }
-}
-
-static size_t llama_state_set_data_internal(struct llama_context * ctx, llama_data_read & data_ctx) {
-    llama_synchronize(ctx);
-
-    data_ctx.read_model_info(ctx);
-
-    // set outputs
-    data_ctx.read_output_ids(ctx);
-    data_ctx.read_logits(ctx);
-    data_ctx.read_embeddings(ctx);
-
-    data_ctx.read_kv_cache(ctx);
-
-    return data_ctx.get_size_read();
-}
-
-// Sets the state reading from the specified source address
-size_t llama_state_set_data(struct llama_context * ctx, const uint8_t * src, size_t size) {
-    llama_data_read_buffer data_ctx(src, size);
-    try {
-        return llama_state_set_data_internal(ctx, data_ctx);
-    } catch (const std::exception & err) {
-        LLAMA_LOG_ERROR("%s: error loading state: %s\n", __func__, err.what());
-        return 0;
-    }
-}
-
-static bool llama_state_load_file_internal(struct llama_context * ctx, const char * path_session, llama_token * tokens_out, size_t n_token_capacity, size_t * n_token_count_out) {
-    llama_file file(path_session, "rb");
-
-    // sanity checks
-    {
-        const uint32_t magic   = file.read_u32();
-        const uint32_t version = file.read_u32();
-
-        if (magic != LLAMA_SESSION_MAGIC || version != LLAMA_SESSION_VERSION) {
-            LLAMA_LOG_ERROR("%s: unknown (magic, version) for session file: %08x, %08x\n", __func__, magic, version);
-            return false;
-        }
-    }
-
-    // load the prompt
-    {
-        const uint32_t n_token_count = file.read_u32();
-
-        if (n_token_count > n_token_capacity) {
-            LLAMA_LOG_ERROR("%s: token count in session file exceeded capacity! %u > %zu\n", __func__, n_token_count, n_token_capacity);
-            return false;
-        }
-
-        file.read_raw(tokens_out, sizeof(llama_token) * n_token_count);
-        *n_token_count_out = n_token_count;
-    }
-
-    // restore the context state
-    {
-        const size_t n_state_size_cur = file.size - file.tell();
-
-        llama_data_read_file data_ctx(&file);
-        const size_t n_read = llama_state_set_data_internal(ctx, data_ctx);
-
-        if (n_read != n_state_size_cur) {
-            LLAMA_LOG_ERROR("%s: did not read all of the session file data! size %zu, got %zu\n", __func__, n_state_size_cur, n_read);
-            return false;
-        }
-    }
-    return true;
-}
-
-bool llama_state_load_file(struct llama_context * ctx, const char * path_session, llama_token * tokens_out, size_t n_token_capacity, size_t * n_token_count_out) {
-    try {
-        return llama_state_load_file_internal(ctx, path_session, tokens_out, n_token_capacity, n_token_count_out);
-    } catch (const std::exception & err) {
-        LLAMA_LOG_ERROR("%s: error loading session file: %s\n", __func__, err.what());
-        return false;
-    }
-}
-
-static bool llama_state_save_file_internal(struct llama_context * ctx, const char * path_session, const llama_token * tokens, size_t n_token_count) {
-    llama_file file(path_session, "wb");
-
-    file.write_u32(LLAMA_SESSION_MAGIC);
-    file.write_u32(LLAMA_SESSION_VERSION);
-
-    // save the prompt
-    file.write_u32((uint32_t) n_token_count);
-    file.write_raw(tokens, sizeof(llama_token) * n_token_count);
-
-    // save the context state using stream saving
-    llama_data_write_file data_ctx(&file);
-    llama_state_get_data_internal(ctx, data_ctx);
-
-    return true;
-}
-
-bool llama_state_save_file(struct llama_context * ctx, const char * path_session, const llama_token * tokens, size_t n_token_count) {
-    try {
-        return llama_state_save_file_internal(ctx, path_session, tokens, n_token_count);
-    } catch (const std::exception & err) {
-        LLAMA_LOG_ERROR("%s: error saving session file: %s\n", __func__, err.what());
-        return false;
-    }
-}
-
-static size_t llama_state_seq_get_data_internal(struct llama_context * ctx, llama_data_write & data_ctx, llama_seq_id seq_id) {
-    llama_synchronize(ctx);
-
-    data_ctx.write_kv_cache(ctx, seq_id);
-
-    return data_ctx.get_size_written();
-}
-
-size_t llama_state_seq_get_size(struct llama_context * ctx, llama_seq_id seq_id) {
-    llama_data_write_dummy data_ctx;
-    return llama_state_seq_get_data_internal(ctx, data_ctx, seq_id);
-}
-
-size_t llama_state_seq_get_data(struct llama_context * ctx, uint8_t * dst, size_t size, llama_seq_id seq_id) {
-    llama_data_write_buffer data_ctx(dst, size);
-    try {
-        return llama_state_seq_get_data_internal(ctx, data_ctx, seq_id);
-    } catch (const std::exception & err) {
-        LLAMA_LOG_ERROR("%s: error saving sequence state: %s\n", __func__, err.what());
-        return 0;
-    }
-}
-
-static size_t llama_state_seq_set_data_internal(struct llama_context * ctx, llama_data_read & data_ctx, llama_seq_id dest_seq_id) {
-    llama_synchronize(ctx);
-
-    data_ctx.read_kv_cache(ctx, dest_seq_id);
-
-    return data_ctx.get_size_read();
-}
-
-size_t llama_state_seq_set_data(struct llama_context * ctx, const uint8_t * src, size_t size, llama_seq_id dest_seq_id) {
-    llama_data_read_buffer data_ctx(src, size);
-    try {
-        return llama_state_seq_set_data_internal(ctx, data_ctx, dest_seq_id);
-    } catch (const std::exception & err) {
-        LLAMA_LOG_ERROR("%s: error loading sequence state: %s\n", __func__, err.what());
-        return 0;
-    }
-}
-
-static size_t llama_state_seq_save_file_internal(struct llama_context * ctx, const char * filepath, llama_seq_id seq_id, const llama_token * tokens, size_t n_token_count) {
-    llama_file file(filepath, "wb");
-
-    file.write_u32(LLAMA_STATE_SEQ_MAGIC);
-    file.write_u32(LLAMA_STATE_SEQ_VERSION);
-
-    // save the prompt
-    file.write_u32((uint32_t) n_token_count);
-    file.write_raw(tokens, sizeof(llama_token) * n_token_count);
-
-    // save the context state using stream saving
-    llama_data_write_file data_ctx(&file);
-    llama_state_seq_get_data_internal(ctx, data_ctx, seq_id);
-
-    const size_t res = file.tell();
-    GGML_ASSERT(res == sizeof(uint32_t) * 3 + sizeof(llama_token) * n_token_count + data_ctx.get_size_written());
-    return res;
-}
-
-static size_t llama_state_seq_load_file_internal(struct llama_context * ctx, const char * filepath, llama_seq_id dest_seq_id, llama_token * tokens_out, size_t n_token_capacity, size_t * n_token_count_out) {
-    llama_file file(filepath, "rb");
-
-    // version checks
-    {
-        const uint32_t magic   = file.read_u32();
-        const uint32_t version = file.read_u32();
-
-        if (magic != LLAMA_STATE_SEQ_MAGIC || version != LLAMA_STATE_SEQ_VERSION) {
-            LLAMA_LOG_ERROR("%s: unknown (magic, version) for sequence state file: %08x, %08x\n", __func__, magic, version);
-            return 0;
-        }
-    }
-
-    // load the prompt
-    {
-        const uint32_t n_token_count = file.read_u32();
-
-        if (n_token_count > n_token_capacity) {
-            LLAMA_LOG_ERROR("%s: token count in sequence state file exceeded capacity! %u > %zu\n", __func__, n_token_count, n_token_capacity);
-            return 0;
-        }
-
-        file.read_raw(tokens_out, sizeof(llama_token) * n_token_count);
-        *n_token_count_out = n_token_count;
-    }
-
-    // restore the context state
-    {
-        const size_t state_size = file.size - file.tell();
-        llama_data_read_file data_ctx(&file);
-        const size_t nread = llama_state_seq_set_data_internal(ctx, data_ctx, dest_seq_id);
-        if (!nread) {
-            LLAMA_LOG_ERROR("%s: failed to restore sequence state\n", __func__);
-            return 0;
-        }
-        GGML_ASSERT(nread <= state_size);
-        GGML_ASSERT(nread + sizeof(uint32_t) * 3 + sizeof(llama_token) * *n_token_count_out == file.tell());
-    }
-
-    return file.tell();
-}
-
-size_t llama_state_seq_save_file(struct llama_context * ctx, const char * filepath, llama_seq_id seq_id, const llama_token * tokens, size_t n_token_count) {
-    try {
-        return llama_state_seq_save_file_internal(ctx, filepath, seq_id, tokens, n_token_count);
-    } catch (const std::exception & err) {
-        LLAMA_LOG_ERROR("%s: error saving sequence state file: %s\n", __func__, err.what());
-        return 0;
-    }
-}
-
-size_t llama_state_seq_load_file(struct llama_context * ctx, const char * filepath, llama_seq_id dest_seq_id, llama_token * tokens_out, size_t n_token_capacity, size_t * n_token_count_out) {
-    try {
-        return llama_state_seq_load_file_internal(ctx, filepath, dest_seq_id, tokens_out, n_token_capacity, n_token_count_out);
-    } catch (const std::exception & err) {
-        LLAMA_LOG_ERROR("%s: error loading sequence state file: %s\n", __func__, err.what());
-        return 0;
-    }
-}
-
-void llama_set_n_threads(struct llama_context * ctx, int32_t n_threads, int32_t n_threads_batch) {
-    ctx->cparams.n_threads       = n_threads;
-    ctx->cparams.n_threads_batch = n_threads_batch;
-}
-
-int32_t llama_n_threads(struct llama_context * ctx) {
-    return ctx->cparams.n_threads;
-}
-
-int32_t llama_n_threads_batch(struct llama_context * ctx) {
-    return ctx->cparams.n_threads_batch;
-}
-
-void llama_set_abort_callback(struct llama_context * ctx, bool (*abort_callback)(void * data), void * abort_callback_data) {
-    ctx->abort_callback      = abort_callback;
-    ctx->abort_callback_data = abort_callback_data;
-}
-
-void llama_set_embeddings(struct llama_context * ctx, bool embeddings) {
-    ctx->cparams.embeddings = embeddings;
-}
-
-void llama_set_causal_attn(struct llama_context * ctx, bool causal_attn) {
-    ctx->cparams.causal_attn = causal_attn;
-}
-
-struct llama_batch llama_batch_get_one(
-             llama_token * tokens,
-                 int32_t   n_tokens,
-               llama_pos   pos_0,
-            llama_seq_id   seq_id) {
-    return {
-        /*n_tokens       =*/ n_tokens,
-        /*tokens         =*/ tokens,
-        /*embd           =*/ nullptr,
-        /*pos            =*/ nullptr,
-        /*n_seq_id       =*/ nullptr,
-        /*seq_id         =*/ nullptr,
-        /*logits         =*/ nullptr,
-        /*all_pos_0      =*/ pos_0,
-        /*all_pos_1      =*/ 1,
-        /*all_seq_id     =*/ seq_id,
-    };
-}
-
-struct llama_batch llama_batch_init(int32_t n_tokens_alloc, int32_t embd, int32_t n_seq_max) {
-    llama_batch batch = {
-        /*n_tokens       =*/ 0,
-        /*tokens         =*/ nullptr,
-        /*embd           =*/ nullptr,
-        /*pos            =*/ nullptr,
-        /*n_seq_id       =*/ nullptr,
-        /*seq_id         =*/ nullptr,
-        /*logits         =*/ nullptr,
-        /*all_pos_0      =*/ 0,
-        /*all_pos_1      =*/ 0,
-        /*all_seq_id     =*/ 0,
-    };
-
-    if (embd) {
-        batch.embd = (float *) malloc(sizeof(float) * n_tokens_alloc * embd);
-    } else {
-        batch.token = (llama_token *) malloc(sizeof(llama_token) * n_tokens_alloc);
-    }
-
-    batch.pos      = (llama_pos *)     malloc(sizeof(llama_pos)      * n_tokens_alloc);
-    batch.n_seq_id = (int32_t *)       malloc(sizeof(int32_t)        * n_tokens_alloc);
-    batch.seq_id   = (llama_seq_id **) malloc(sizeof(llama_seq_id *) * (n_tokens_alloc + 1));
-    for (int i = 0; i < n_tokens_alloc; ++i) {
-        batch.seq_id[i] = (llama_seq_id *) malloc(sizeof(llama_seq_id) * n_seq_max);
-    }
-    batch.seq_id[n_tokens_alloc] = nullptr;
-
-    batch.logits   = (int8_t *)        malloc(sizeof(int8_t)         * n_tokens_alloc);
-
-    return batch;
-}
-
-void llama_batch_free(struct llama_batch batch) {
-    if (batch.token)    free(batch.token);
-    if (batch.embd)     free(batch.embd);
-    if (batch.pos)      free(batch.pos);
-    if (batch.n_seq_id) free(batch.n_seq_id);
-    if (batch.seq_id) {
-        for (int i = 0; batch.seq_id[i] != nullptr; ++i) {
-            free(batch.seq_id[i]);
-        }
-        free(batch.seq_id);
-    }
-    if (batch.logits)   free(batch.logits);
-}
-
-int32_t llama_encode(
-        struct llama_context * ctx,
-          struct llama_batch   batch) {
-    const int ret = llama_encode_internal(*ctx, batch);
-    if (ret < 0) {
-        LLAMA_LOG_ERROR("%s: failed to encode, ret = %d\n", __func__, ret);
-    }
-
-    return ret;
-}
-
-int32_t llama_decode(
-        struct llama_context * ctx,
-          struct llama_batch   batch) {
-    const int ret = llama_decode_internal(*ctx, batch);
-    if (ret < 0) {
-        LLAMA_LOG_ERROR("%s: failed to decode, ret = %d\n", __func__, ret);
-    }
-
-    return ret;
-}
-
-void llama_synchronize(struct llama_context * ctx) {
-    ggml_backend_sched_synchronize(ctx->sched);
-
-    // FIXME: if multiple single tokens are evaluated without a synchronization,
-    // the stats will be added to the prompt evaluation stats
-    // this should only happen when using batch size 1 to evaluate a batch
-
-    // add the evaluation to the stats
-    if (ctx->n_queued_tokens == 1) {
-        if (!ctx->cparams.no_perf) {
-            ctx->t_eval_us += ggml_time_us() - ctx->t_compute_start_us;
-        }
-        ctx->n_eval++;
-    } else if (ctx->n_queued_tokens > 1) {
-        if (!ctx->cparams.no_perf) {
-            ctx->t_p_eval_us += ggml_time_us() - ctx->t_compute_start_us;
-        }
-        ctx->n_p_eval += ctx->n_queued_tokens;
-    }
-
-    // get a more accurate load time, upon first eval
-    if (ctx->n_queued_tokens > 0 && !ctx->has_evaluated_once) {
-        ctx->t_load_us = ggml_time_us() - ctx->t_start_us;
-        ctx->has_evaluated_once = true;
-    }
-
-    ctx->n_queued_tokens = 0;
-    ctx->t_compute_start_us = 0;
-}
-
-float * llama_get_logits(struct llama_context * ctx) {
-    llama_synchronize(ctx);
-
-    // reorder logits for backward compatibility
-    // TODO: maybe deprecate this
-    llama_output_reorder(ctx);
-
-    return ctx->logits;
-}
-
-float * llama_get_logits_ith(struct llama_context * ctx, int32_t i) {
-    int32_t j = -1;
-    llama_synchronize(ctx);
-
-    try {
-        if (ctx->logits == nullptr) {
-            throw std::runtime_error("no logits");
-        }
-
-        if (i < 0) {
-            j = ctx->n_outputs + i;
-            if (j < 0) {
-                throw std::runtime_error(format("negative index out of range [0, %d)", ctx->n_outputs));
-            }
-        } else if ((size_t) i >= ctx->output_ids.size()) {
-            throw std::runtime_error(format("out of range [0, %lu)", ctx->output_ids.size()));
-        } else {
-            j = ctx->output_ids[i];
-        }
-
-        if (j < 0) {
-            throw std::runtime_error(format("batch.logits[%d] != true", i));
-        }
-        if (j >= ctx->n_outputs) {
-            // This should not happen
-            throw std::runtime_error(format("corrupt output buffer (j=%d, n_outputs=%d)", j, ctx->n_outputs));
-        }
-
-        return ctx->logits + j*ctx->model.hparams.n_vocab;
-    } catch (const std::exception & err) {
-        LLAMA_LOG_ERROR("%s: invalid logits id %d, reason: %s\n", __func__, i, err.what());
-#ifndef NDEBUG
-        GGML_ABORT("fatal error");
-#else
-        return nullptr;
-#endif
-    }
-}
-
-float * llama_get_embeddings(struct llama_context * ctx) {
-    llama_synchronize(ctx);
-
-    // reorder embeddings for backward compatibility
-    // TODO: maybe deprecate this
-    llama_output_reorder(ctx);
-
-    return ctx->embd;
-}
-
-float * llama_get_embeddings_ith(struct llama_context * ctx, int32_t i) {
-    int32_t j = -1;
-
-    llama_synchronize(ctx);
-
-    try {
-        if (ctx->embd == nullptr) {
-            throw std::runtime_error("no embeddings");
-        }
-
-        if (i < 0) {
-            j = ctx->n_outputs + i;
-            if (j < 0) {
-                throw std::runtime_error(format("negative index out of range [0, %d)", ctx->n_outputs));
-            }
-        } else if ((size_t) i >= ctx->output_ids.size()) {
-            throw std::runtime_error(format("out of range [0, %lu)", ctx->output_ids.size()));
-        } else {
-            j = ctx->output_ids[i];
-        }
-
-        if (j < 0) {
-            throw std::runtime_error(format("batch.logits[%d] != true", i));
-        }
-        if (j >= ctx->n_outputs) {
-            // This should not happen
-            throw std::runtime_error(format("corrupt output buffer (j=%d, n_outputs=%d)", j, ctx->n_outputs));
-        }
-
-        return ctx->embd + j*ctx->model.hparams.n_embd;
-    } catch (const std::exception & err) {
-        LLAMA_LOG_ERROR("%s: invalid embeddings id %d, reason: %s\n", __func__, i, err.what());
-#ifndef NDEBUG
-        GGML_ABORT("fatal error");
-#else
-        return nullptr;
-#endif
-    }
-}
-
-float * llama_get_embeddings_seq(struct llama_context * ctx, llama_seq_id seq_id) {
-    llama_synchronize(ctx);
-
-    auto it = ctx->embd_seq.find(seq_id);
-    if (it == ctx->embd_seq.end()) {
+struct llama_model * llama_model_load_from_splits(
+        const char ** paths,
+        size_t n_paths,
+        struct llama_model_params params) {
+    std::vector<std::string> splits;
+    if (n_paths == 0) {
+        LLAMA_LOG_ERROR("%s: list of splits is empty\n", __func__);
         return nullptr;
     }
-
-    return it->second.data();
+    splits.reserve(n_paths);
+    for (size_t i = 0; i < n_paths; ++i) {
+        splits.push_back(paths[i]);
+    }
+    return llama_model_load_from_file_impl(splits.front(), splits, params);
 }
 
-//
-// vocab
-//
-
-const char * llama_token_get_text(const struct llama_model * model, llama_token token) {
-    return llama_token_get_text_impl(model->vocab, token);
-}
-
-float llama_token_get_score(const struct llama_model * model, llama_token token) {
-    return llama_token_get_score_impl(model->vocab, token);
-}
-
-enum llama_token_attr llama_token_get_attr(const struct llama_model * model, llama_token token) {
-    return llama_token_get_attr_impl(model->vocab, token);
-}
-
-bool llama_token_is_eog(const struct llama_model * model, llama_token token) {
-    return llama_token_is_eog_impl(model->vocab, token);
-}
-
-bool llama_token_is_control(const struct llama_model * model, llama_token token) {
-    return llama_token_is_control_impl(model->vocab, token);
-}
-
-llama_token llama_token_bos(const struct llama_model * model) {
-    return llama_token_bos_impl(model->vocab);
-}
-
-llama_token llama_token_eos(const struct llama_model * model) {
-    return llama_token_eos_impl(model->vocab);
-}
-
-llama_token llama_token_eot(const struct llama_model * model) {
-    return llama_token_eot_impl(model->vocab);
-}
-
-llama_token llama_token_cls(const struct llama_model * model) {
-    return llama_token_cls_impl(model->vocab);
-}
-
-llama_token llama_token_sep(const struct llama_model * model) {
-    return llama_token_sep_impl(model->vocab);
-}
-
-llama_token llama_token_nl (const struct llama_model * model) {
-    return llama_token_nl_impl(model->vocab);
-}
-
-llama_token llama_token_pad(const struct llama_model * model) {
-    return llama_token_pad_impl(model->vocab);
-}
-
-bool llama_add_bos_token(const struct llama_model * model) {
-    return llama_add_bos_token_impl(model->vocab);
-}
-
-bool llama_add_eos_token(const struct llama_model * model) {
-    return llama_add_eos_token_impl(model->vocab);
-}
-
-llama_token llama_token_prefix(const struct llama_model * model) {
-    return llama_token_prefix_impl(model->vocab);
-}
-
-llama_token llama_token_middle(const struct llama_model * model) {
-    return llama_token_middle_impl(model->vocab);
-}
-
-llama_token llama_token_suffix(const struct llama_model * model) {
-    return llama_token_suffix_impl(model->vocab);
-}
-
-llama_token llama_token_fim_pre(const struct llama_model * model) {
-    return llama_token_fim_pre_impl(model->vocab);
-}
-
-llama_token llama_token_fim_suf(const struct llama_model * model) {
-    return llama_token_fim_suf_impl(model->vocab);
-}
-
-llama_token llama_token_fim_mid(const struct llama_model * model) {
-    return llama_token_fim_mid_impl(model->vocab);
-}
-
-llama_token llama_token_fim_pad(const struct llama_model * model) {
-    return llama_token_fim_pad_impl(model->vocab);
-}
-
-llama_token llama_token_fim_rep(const struct llama_model * model) {
-    return llama_token_fim_rep_impl(model->vocab);
-}
-
-llama_token llama_token_fim_sep(const struct llama_model * model) {
-    return llama_token_fim_sep_impl(model->vocab);
-}
-
-//
-// tokenization
-//
-
-int32_t llama_tokenize(
-    const struct llama_model * model,
-                  const char * text,
-                     int32_t   text_len,
-                 llama_token * tokens,
-                     int32_t   n_tokens_max,
-                        bool   add_special,
-                        bool   parse_special) {
-    return llama_tokenize_impl(model->vocab, text, text_len, tokens, n_tokens_max, add_special, parse_special);
-}
-
-int32_t llama_token_to_piece(
-    const struct llama_model * model,
-                 llama_token   token,
-                        char * buf,
-                     int32_t   length,
-                     int32_t   lstrip,
-                        bool   special) {
-    return llama_token_to_piece_impl(model->vocab, token, buf, length, lstrip, special);
-}
-
-int32_t llama_detokenize(
-    const struct llama_model * model,
-           const llama_token * tokens,
-                     int32_t   n_tokens,
-                        char * text,
-                     int32_t   text_len_max,
-                        bool   remove_special,
-                        bool   unparse_special) {
-    return llama_detokenize_impl(model->vocab, tokens, n_tokens, text, text_len_max, remove_special, unparse_special);
+void llama_model_save_to_file(const struct llama_model * model, const char * path_model) {
+    llama_model_saver ms(*model);
+    ms.add_kv_from_model();
+    ms.add_tensors_from_model();
+    ms.save(path_model);
 }
 
 //
@@ -22171,27 +21575,13 @@ static int32_t llama_chat_apply_template_internal(
 }
 
 int32_t llama_chat_apply_template(
-                const struct llama_model * model,
                               const char * tmpl,
          const struct llama_chat_message * chat,
                                   size_t   n_msg,
                                     bool   add_ass,
                                     char * buf,
                                  int32_t   length) {
-    std::string curr_tmpl(tmpl == nullptr ? "" : tmpl);
-    if (tmpl == nullptr) {
-        GGML_ASSERT(model != nullptr);
-        // load template from model
-        std::vector<char> model_template(2048, 0); // longest known template is about 1200 bytes
-        std::string template_key = "tokenizer.chat_template";
-        int32_t res = llama_model_meta_val_str(model, template_key.c_str(), model_template.data(), model_template.size());
-        if (res < 0) {
-            // worst case: there is no information about template, we will use chatml by default
-            curr_tmpl = "chatml"; // see llama_chat_apply_template_internal
-        } else {
-            curr_tmpl = std::string(model_template.data(), model_template.size());
-        }
-    }
+    const std::string curr_tmpl(tmpl == nullptr ? "chatml" : tmpl);
 
     // format the chat to string
     std::vector<const llama_chat_message *> chat_vec;
@@ -22201,7 +21591,11 @@ int32_t llama_chat_apply_template(
     }
 
     std::string formatted_chat;
-    int32_t res = llama_chat_apply_template_internal(curr_tmpl, chat_vec, formatted_chat, add_ass);
+    llm_chat_template detected_tmpl = llm_chat_detect_template(curr_tmpl);
+    if (detected_tmpl == LLM_CHAT_TEMPLATE_UNKNOWN) {
+        return -1;
+    }
+    int32_t res = llm_chat_apply_template(detected_tmpl, chat_vec, formatted_chat, add_ass);
     if (res < 0) {
         return res;
     }
@@ -22209,15 +21603,6 @@ int32_t llama_chat_apply_template(
         strncpy(buf, formatted_chat.c_str(), length);
     }
     return res;
-}
-
-//
-// sampling
-//
-
-// TODO: remove indirection when vocab becomes accesible in llama-sampling.cpp
-struct llama_sampler * llama_sampler_init_grammar(const struct llama_model * model, const char * grammar_str, const char * grammar_root) {
-    return llama_sampler_init_grammar_impl(model->vocab, grammar_str, grammar_root);
 }
 
 //
@@ -22232,16 +21617,16 @@ int llama_split_path(char * split_path, size_t maxlen, const char * path_prefix,
     return 0;
 }
 
-int llama_split_prefix(char * dest, size_t maxlen, const char * split_path, int split_no, int split_count) {
+int llama_split_prefix(char * split_prefix, size_t maxlen, const char * split_path, int split_no, int split_count) {
     std::string str_split_path(split_path);
     char postfix[32];
     snprintf(postfix, 32, "-%05d-of-%05d.gguf", split_no + 1, split_count);
     std::string str_postfix(postfix);
 
-    // check if dest ends with postfix
+    // check if split_prefix ends with postfix
     int size_prefix = str_split_path.size() - str_postfix.size();
     if (size_prefix > 0 && str_split_path.find(str_postfix, size_prefix) != std::string::npos) {
-        snprintf(dest, std::min((size_t) size_prefix + 1, maxlen), "%s", split_path);
+        snprintf(split_prefix, std::min((size_t) size_prefix + 1, maxlen), "%s", split_path);
         return size_prefix;
     }
 
@@ -22250,131 +21635,24 @@ int llama_split_prefix(char * dest, size_t maxlen, const char * split_path, int 
 
 const char * llama_print_system_info(void) {
     static std::string s;
+    s.clear(); // Clear the string, since it's static, otherwise it will accumulate data from previous calls.
 
-    s  = "";
-    s += "AVX = "         + std::to_string(ggml_cpu_has_avx())         + " | ";
-    s += "AVX_VNNI = "    + std::to_string(ggml_cpu_has_avx_vnni())    + " | ";
-    s += "AVX2 = "        + std::to_string(ggml_cpu_has_avx2())        + " | ";
-    s += "AVX512 = "      + std::to_string(ggml_cpu_has_avx512())      + " | ";
-    s += "AVX512_VBMI = " + std::to_string(ggml_cpu_has_avx512_vbmi()) + " | ";
-    s += "AVX512_VNNI = " + std::to_string(ggml_cpu_has_avx512_vnni()) + " | ";
-    s += "AVX512_BF16 = " + std::to_string(ggml_cpu_has_avx512_bf16()) + " | ";
-    s += "FMA = "         + std::to_string(ggml_cpu_has_fma())         + " | ";
-    s += "NEON = "        + std::to_string(ggml_cpu_has_neon())        + " | ";
-    s += "SVE = "         + std::to_string(ggml_cpu_has_sve())         + " | ";
-    s += "ARM_FMA = "     + std::to_string(ggml_cpu_has_arm_fma())     + " | ";
-    s += "F16C = "        + std::to_string(ggml_cpu_has_f16c())        + " | ";
-    s += "FP16_VA = "     + std::to_string(ggml_cpu_has_fp16_va())     + " | ";
-    s += "RISCV_VECT = "  + std::to_string(ggml_cpu_has_riscv_v())     + " | ";
-    s += "WASM_SIMD = "   + std::to_string(ggml_cpu_has_wasm_simd())   + " | ";
-    s += "BLAS = "        + std::to_string(ggml_cpu_has_blas())        + " | ";
-    s += "SSE3 = "        + std::to_string(ggml_cpu_has_sse3())        + " | ";
-    s += "SSSE3 = "       + std::to_string(ggml_cpu_has_ssse3())       + " | ";
-    s += "VSX = "         + std::to_string(ggml_cpu_has_vsx())         + " | ";
-    s += "MATMUL_INT8 = " + std::to_string(ggml_cpu_has_matmul_int8()) + " | ";
-    s += "LLAMAFILE = "   + std::to_string(ggml_cpu_has_llamafile())   + " | ";
+    for (size_t i = 0; i < ggml_backend_reg_count(); i++) {
+        auto * reg = ggml_backend_reg_get(i);
+        auto * get_features_fn = (ggml_backend_get_features_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_get_features");
+        if (get_features_fn) {
+            ggml_backend_feature * features = get_features_fn(reg);
+            s += ggml_backend_reg_name(reg);
+            s += " : ";
+            for (; features->name; features++) {
+                s += features->name;
+                s += " = ";
+                s += features->value;
+                s += " | ";
+            }
+        }
+    }
 
     return s.c_str();
 }
 
-struct llama_perf_context_data llama_perf_context(const struct llama_context * ctx) {
-    struct llama_perf_context_data data = {};
-
-    if (ctx == nullptr) {
-        return data;
-    }
-
-    data.t_start_ms  = 1e-3 * ctx->t_start_us;
-    data.t_load_ms   = 1e-3 * ctx->t_load_us;
-    data.t_p_eval_ms = 1e-3 * ctx->t_p_eval_us;
-    data.t_eval_ms   = 1e-3 * ctx->t_eval_us;
-    data.n_p_eval    = std::max(1, ctx->n_p_eval);
-    data.n_eval      = std::max(1, ctx->n_eval);
-
-    return data;
-}
-
-void llama_perf_context_print(const struct llama_context * ctx) {
-    const auto data = llama_perf_context(ctx);
-
-    const double t_end_ms = 1e-3 * ggml_time_us();
-
-    LLAMA_LOG_INFO("%s:        load time = %10.2f ms\n", __func__, data.t_load_ms);
-    LLAMA_LOG_INFO("%s: prompt eval time = %10.2f ms / %5d tokens (%8.2f ms per token, %8.2f tokens per second)\n",
-            __func__, data.t_p_eval_ms, data.n_p_eval, data.t_p_eval_ms / data.n_p_eval, 1e3 / data.t_p_eval_ms * data.n_p_eval);
-    LLAMA_LOG_INFO("%s:        eval time = %10.2f ms / %5d runs   (%8.2f ms per token, %8.2f tokens per second)\n",
-            __func__, data.t_eval_ms, data.n_eval, data.t_eval_ms / data.n_eval, 1e3 / data.t_eval_ms * data.n_eval);
-    LLAMA_LOG_INFO("%s:       total time = %10.2f ms / %5d tokens\n", __func__, (t_end_ms - data.t_start_ms), (data.n_p_eval + data.n_eval));
-}
-
-void llama_perf_context_reset(struct llama_context * ctx) {
-    ctx->t_start_us  = ggml_time_us();
-    ctx->t_eval_us   = ctx->n_eval = 0;
-    ctx->t_p_eval_us = ctx->n_p_eval = 0;
-}
-
-void llama_perf_dump_yaml(FILE * stream, const llama_context * ctx) {
-    fprintf(stream, "\n");
-    fprintf(stream, "###########\n");
-    fprintf(stream, "# Timings #\n");
-    fprintf(stream, "###########\n");
-    fprintf(stream, "\n");
-
-    fprintf(stream, "mst_eval: %.2f  # ms / token during generation\n",
-            1.0e-3 * ctx->t_eval_us / ctx->n_eval);
-    fprintf(stream, "mst_p_eval: %.2f  # ms / token during prompt processing\n",
-            1.0e-3 * ctx->t_p_eval_us / ctx->n_p_eval);
-    fprintf(stream, "n_eval: %d  # number of tokens generated (excluding the first one)\n", ctx->n_eval);
-    fprintf(stream, "n_p_eval: %d  # number of tokens processed in batches at the beginning\n", ctx->n_p_eval);
-    fprintf(stream, "t_eval_us: %" PRId64 "  # total microseconds spent generating tokens\n", ctx->t_eval_us);
-    fprintf(stream, "t_load_us: %" PRId64 "  # total microseconds spent loading the model\n", ctx->t_load_us);
-    fprintf(stream, "t_p_eval_us: %" PRId64 "  # total microseconds spent prompt processing\n", ctx->t_p_eval_us);
-    fprintf(stream, "ts_eval: %.2f  # tokens / second during generation\n",
-            1.0e6 * ctx->n_eval / ctx->t_eval_us);
-    fprintf(stream, "ts_p_eval: %.2f  # tokens / second during prompt processing\n",
-            1.0e6 * ctx->n_p_eval / ctx->t_p_eval_us);
-}
-
-// For internal test use
-const std::vector<std::pair<std::string, struct ggml_tensor *>> & llama_internal_get_tensor_map(
-    struct llama_context * ctx
-) {
-    return ctx->model.tensors_by_name;
-}
-
-void llama_log_set(ggml_log_callback log_callback, void * user_data) {
-    ggml_log_set(log_callback, user_data);
-    g_logger_state.log_callback = log_callback ? log_callback : llama_log_callback_default;
-    g_logger_state.log_callback_user_data = user_data;
-}
-
-static void llama_log_internal_v(ggml_log_level level, const char * format, va_list args) {
-    va_list args_copy;
-    va_copy(args_copy, args);
-    char buffer[128];
-    int len = vsnprintf(buffer, 128, format, args);
-    if (len < 128) {
-        g_logger_state.log_callback(level, buffer, g_logger_state.log_callback_user_data);
-    } else {
-        char * buffer2 = new char[len + 1];
-        vsnprintf(buffer2, len + 1, format, args_copy);
-        buffer2[len] = 0;
-        g_logger_state.log_callback(level, buffer2, g_logger_state.log_callback_user_data);
-        delete[] buffer2;
-    }
-    va_end(args_copy);
-}
-
-void llama_log_internal(ggml_log_level level, const char * format, ...) {
-    va_list args;
-    va_start(args, format);
-    llama_log_internal_v(level, format, args);
-    va_end(args);
-}
-
-void llama_log_callback_default(ggml_log_level level, const char * text, void * user_data) {
-    (void) level;
-    (void) user_data;
-    fputs(text, stderr);
-    fflush(stderr);
-}

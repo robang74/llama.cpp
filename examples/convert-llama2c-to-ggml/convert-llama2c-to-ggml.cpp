@@ -1,4 +1,6 @@
 #include "ggml.h"
+#include "gguf.h"
+
 #include "llama.h"
 #include "common.h"
 #include "log.h"
@@ -331,17 +333,17 @@ static void print_params(struct my_llama_hparams * params) {
 }
 
 static void print_tensor_info(const struct ggml_context * ctx) {
-    for (auto t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+    for (auto * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
         LOG_INF("%s: Allocating ", __func__);
         int64_t total = 1;
         int i = 0;
         for (; i < ggml_n_dims(t); ++i) {
-            if (i > 0) LOG("x ");
-            LOG("[%" PRId64 "] ", t->ne[i]);
+            if (i > 0) { LOG_INF("x "); }
+            LOG_INF("[%" PRId64 "] ", t->ne[i]);
             total *= t->ne[i];
         }
-        if (i > 1) LOG("= [%" PRId64 "] ", total);
-        LOG("float space for %s\n", ggml_get_name(t));
+        if (i > 1) { LOG_INF("= [%" PRId64 "] ", total); }
+        LOG_INF("float space for %s\n", ggml_get_name(t));
     }
 }
 
@@ -434,12 +436,12 @@ static void print_matrix(struct ggml_tensor * probs) {
     }
 }
 
-struct llama_file {
+struct my_llama_file {
     // use FILE * so we don't have to re-open the file to mmap
     FILE * fp;
     size_t size;
 
-    llama_file(const char * fname, const char * mode) {
+    my_llama_file(const char * fname, const char * mode) {
         fp = std::fopen(fname, mode);
         if (fp == NULL) {
             size = 0;
@@ -500,7 +502,7 @@ struct llama_file {
         return std::string(chars.data(), len);
     }
 
-    ~llama_file() {
+    ~my_llama_file() {
         if (fp) {
             std::fclose(fp);
         }
@@ -508,7 +510,7 @@ struct llama_file {
 };
 
 static bool is_ggml_file(const char * filename) {
-    llama_file file(filename, "rb");
+    my_llama_file file(filename, "rb");
     if (file.size < 4) {
         return false;
     }
@@ -576,7 +578,7 @@ static void load_vocab(const char * filename, const Config * config, struct my_l
     } else {
         // assume llama2.c vocabulary
         LOG_INF("%s: Assuming llama2.c vocabulary since %s is not a gguf file\n", __func__, filename);
-        llama_file file(filename, "rb");
+        my_llama_file file(filename, "rb");
         if (!file.fp) {
             die_fmt("%s: %s", strerror(errno), filename);
         }
@@ -689,8 +691,8 @@ static void save_as_llama_model(
     gguf_set_val_u32(ctx, KV_TOKENIZER_UNK_ID, UNKNOWN_TOKEN_ID);
     gguf_set_val_u32(ctx, KV_TOKENIZER_BOS_ID, BOS_TOKEN_ID);
     gguf_set_val_u32(ctx, KV_TOKENIZER_EOS_ID, EOS_TOKEN_ID);
-    gguf_set_val_u32(ctx, KV_TOKENIZER_SEP_ID, -1);
-    gguf_set_val_u32(ctx, KV_TOKENIZER_PAD_ID, -1);
+    gguf_set_val_u32(ctx, KV_TOKENIZER_SEP_ID, LLAMA_TOKEN_NULL);
+    gguf_set_val_u32(ctx, KV_TOKENIZER_PAD_ID, LLAMA_TOKEN_NULL);
 
     gguf_set_val_u32(ctx, KV_CONTEXT_LENGTH, model->hparams.n_ctx);
     gguf_set_val_u32(ctx, KV_EMBEDDING_LENGTH, model->hparams.n_embd);
@@ -909,7 +911,7 @@ int main(int argc, char ** argv) {
     load_vocab(params.fn_vocab_model, &config, &vocab);
 
     struct my_llama_model model;
-    model.hparams.n_vocab   = config.vocab_size; //llama_n_vocab(lctx);
+    model.hparams.n_vocab   = config.vocab_size; //llama_vocab_n_vocab(lctx);
     model.hparams.n_ctx     = params.n_ctx;
     model.hparams.n_embd    = config.dim; //params.n_embd;
     model.hparams.n_ff      = config.hidden_dim;

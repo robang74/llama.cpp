@@ -76,7 +76,7 @@ class LibLlamaModel:
         self.ffi = libllama.ffi
         if isinstance(mparams, dict):
             mparams = libllama.model_default_params(**mparams)
-        self.model = self.lib.llama_load_model_from_file(path_model.encode(), mparams)
+        self.model = self.lib.llama_model_load_from_file(path_model.encode(), mparams)
         if not self.model:
             raise RuntimeError("error: failed to load model '%s'" % path_model)
         if isinstance(cparams, dict):
@@ -92,7 +92,7 @@ class LibLlamaModel:
         if self.ctx:
             self.lib.llama_free(self.ctx)
         if self.model:
-            self.lib.llama_free_model(self.model)
+            self.lib.llama_model_free(self.model)
         self.ctx = None
         self.model = None
         self.lib = None
@@ -421,10 +421,10 @@ def compare_tokenizers(tokenizer1: TokenizerGroundtruth, tokenizer2: TokenizerLl
         if text1 == text2:  # equal to TokenizerGroundtruth?
             return True
         # equal to source text?
-        if tokenizer1.add_bos_token:  # remove BOS
+        if tokenizer1.add_bos_token and tokenizer1.bos_token and isinstance(tokenizer1.bos_token, str):  # remove BOS
             if text2.startswith(tokenizer1.bos_token):
                 text2 = text2[len(tokenizer1.bos_token):]
-        if tokenizer1.add_eos_token:  # remove EOS
+        if tokenizer1.add_eos_token and tokenizer1.eos_token and isinstance(tokenizer1.eos_token, str):  # remove EOS
             if text2.endswith(tokenizer1.eos_token):
                 text2 = text2[:-len(tokenizer1.eos_token)]
         return text == text2

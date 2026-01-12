@@ -3,7 +3,9 @@
 #endif
 
 #include "llama.h"
-#include "llama-grammar.h"
+
+// TODO: shold not include libllama sources
+#include "../src/llama-grammar.h"
 
 #include <cassert>
 
@@ -510,6 +512,20 @@ int main()
         {LLAMA_GRETYPE_CHAR_ALT, '\n'},
         {LLAMA_GRETYPE_RULE_REF, /* ws_12 */ 12},
         {LLAMA_GRETYPE_ALT, 0},
+        {LLAMA_GRETYPE_END, 0},
+    });
+
+    // <[1000]> = "<think>"
+    // <[1001]> = "</think>"
+    verify_parsing(R"""(
+        root  ::= <[1000]> !<[1001]> <[1001]>
+    )""", {
+        {"root", 0}
+    }, {
+        // root (index 0)
+        {LLAMA_GRETYPE_TOKEN, 1000},
+        {LLAMA_GRETYPE_TOKEN_NOT, 1001},
+        {LLAMA_GRETYPE_TOKEN, 1001},
         {LLAMA_GRETYPE_END, 0},
     });
 

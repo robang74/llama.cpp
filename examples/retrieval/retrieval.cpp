@@ -81,14 +81,14 @@ static void batch_add_seq(llama_batch & batch, const std::vector<int32_t> & toke
     }
 }
 
-static void batch_decode(llama_context * ctx, llama_batch & batch, float * output, int n_seq, int n_embd) {
+static void batch_process(llama_context * ctx, llama_batch & batch, float * output, int n_seq, int n_embd) {
     // clear previous kv_cache values (irrelevant for embeddings)
-    llama_kv_cache_clear(ctx);
+    llama_memory_clear(llama_get_memory(ctx), false);
 
     // run model
     LOG_INF("%s: n_tokens = %d, n_seq = %d\n", __func__, batch.n_tokens, n_seq);
     if (llama_decode(ctx, batch) < 0) {
-        LOG_ERR("%s : failed to decode\n", __func__);
+        LOG_ERR("%s : failed to process\n", __func__);
     }
 
     for (int i = 0; i < batch.n_tokens; i++) {
@@ -107,7 +107,7 @@ static void batch_decode(llama_context * ctx, llama_batch & batch, float * outpu
         }
 
         float * out = output + batch.seq_id[i][0] * n_embd;
-        common_embd_normalize(embd, out, n_embd);
+        common_embd_normalize(embd, out, n_embd, 2);
     }
 }
 
@@ -143,23 +143,25 @@ int main(int argc, char ** argv) {
         std::vector<chunk> file_chunk = chunk_file(context_file, params.chunk_size, params.chunk_separator);
         chunks.insert(chunks.end(), file_chunk.begin(), file_chunk.end());
     }
-    LOG_INF("Number of chunks: %ld\n", chunks.size());
+    LOG_INF("Number of chunks: %zu\n", chunks.size());
 
     llama_backend_init();
     llama_numa_init(params.numa);
 
     // load the model
-    common_init_result llama_init = common_init_from_params(params);
+    auto llama_init = common_init_from_params(params);
 
-    llama_model * model = llama_init.model;
-    llama_context * ctx = llama_init.context;
+    auto * model = llama_init->model();
+    auto * ctx   = llama_init->context();
 
     if (model == NULL) {
         LOG_ERR("%s: unable to load model\n", __func__);
         return 1;
     }
 
-    const int n_ctx_train = llama_n_ctx_train(model);
+    const llama_vocab * vocab = llama_model_get_vocab(model);
+
+    const int n_ctx_train = llama_model_n_ctx_train(model);
     const int n_ctx = llama_n_ctx(ctx);
 
     const enum llama_pooling_type pooling_type = llama_pooling_type(ctx);
@@ -192,8 +194,8 @@ int main(int argc, char ** argv) {
             return 1;
         }
         // add eos if not present
-        if (llama_token_eos(model) >= 0 && (inp.empty() || inp.back() != llama_token_eos(model))) {
-            inp.push_back(llama_token_eos(model));
+        if (llama_vocab_eos(vocab) >= 0 && (inp.empty() || inp.back() != llama_vocab_eos(vocab))) {
+            inp.push_back(llama_vocab_eos(vocab));
         }
         chunk.tokens = inp;
     }
@@ -215,13 +217,13 @@ int main(int argc, char ** argv) {
     struct llama_batch batch = llama_batch_init(n_batch, 0, 1);
 
     // allocate output
-    const int n_embd = llama_n_embd(model);
-    std::vector<float> embeddings(n_chunks * n_embd, 0);
+    const int n_embd_out = llama_model_n_embd_out(model);
+    std::vector<float> embeddings(n_chunks * n_embd_out, 0);
     float * emb = embeddings.data();
 
     // break into batches
-    int p = 0; // number of prompts processed already
-    int s = 0; // number of prompts in current batch
+    unsigned int p = 0; // number of prompts processed already
+    unsigned int s = 0; // number of prompts in current batch
     for (int k = 0; k < n_chunks; k++) {
         // clamp to n_batch tokens
         auto & inp = chunks[k].tokens;
@@ -229,9 +231,9 @@ int main(int argc, char ** argv) {
         const uint64_t n_toks = inp.size();
 
         // encode if at capacity
-        if (batch.n_tokens + n_toks > n_batch) {
-            float * out = emb + p * n_embd;
-            batch_decode(ctx, batch, out, s, n_embd);
+        if (batch.n_tokens + n_toks > n_batch || s >= llama_n_seq_max(ctx)) {
+            float * out = emb + p * n_embd_out;
+            batch_process(ctx, batch, out, s, n_embd_out);
             common_batch_clear(batch);
             p += s;
             s = 0;
@@ -243,12 +245,12 @@ int main(int argc, char ** argv) {
     }
 
     // final batch
-    float * out = emb + p * n_embd;
-    batch_decode(ctx, batch, out, s, n_embd);
+    float * out = emb + p * n_embd_out;
+    batch_process(ctx, batch, out, s, n_embd_out);
 
     // save embeddings to chunks
     for (int i = 0; i < n_chunks; i++) {
-        chunks[i].embedding = std::vector<float>(emb + i * n_embd, emb + (i + 1) * n_embd);
+        chunks[i].embedding = std::vector<float>(emb + i * n_embd_out, emb + (i + 1) * n_embd_out);
         // clear tokens as they are no longer needed
         chunks[i].tokens.clear();
     }
@@ -264,8 +266,8 @@ int main(int argc, char ** argv) {
 
         batch_add_seq(query_batch, query_tokens, 0);
 
-        std::vector<float> query_emb(n_embd, 0);
-        batch_decode(ctx, query_batch, query_emb.data(), 1, n_embd);
+        std::vector<float> query_emb(n_embd_out, 0);
+        batch_process(ctx, query_batch, query_emb.data(), 1, n_embd_out);
 
         common_batch_clear(query_batch);
 
@@ -273,7 +275,7 @@ int main(int argc, char ** argv) {
         {
             std::vector<std::pair<int, float>> similarities;
             for (int i = 0; i < n_chunks; i++) {
-                float sim = common_embd_similarity_cos(chunks[i].embedding.data(), query_emb.data(), n_embd);
+                float sim = common_embd_similarity_cos(chunks[i].embedding.data(), query_emb.data(), n_embd_out);
                 similarities.push_back(std::make_pair(i, sim));
             }
 
@@ -282,8 +284,8 @@ int main(int argc, char ** argv) {
                 return a.second > b.second;
             });
 
-            LOG("Top %d similar chunks:\n", params.sparams.top_k);
-            for (int i = 0; i < std::min(params.sparams.top_k, (int) chunks.size()); i++) {
+            LOG("Top %d similar chunks:\n", params.sampling.top_k);
+            for (int i = 0; i < std::min(params.sampling.top_k, (int) chunks.size()); i++) {
                 LOG("filename: %s\n", chunks[similarities[i].first].filename.c_str());
                 LOG("filepos: %lld\n", (long long int) chunks[similarities[i].first].filepos);
                 LOG("similarity: %f\n", similarities[i].second);
@@ -298,7 +300,5 @@ int main(int argc, char ** argv) {
 
     // clean up
     llama_batch_free(query_batch);
-    llama_free(ctx);
-    llama_free_model(model);
     llama_backend_free();
 }
